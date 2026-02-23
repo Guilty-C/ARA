@@ -154,7 +154,7 @@ def _doctor_ping(base: str, timeout: float = 2.0) -> bool:
 
 def cmd_doctor(_: argparse.Namespace) -> int:
     tool_base = os.environ.get("TOOL_API_BASE")
-    provider_mode = os.environ.get("PROVIDER_MODE", "LIVE")
+    provider_mode = os.environ.get("PROVIDER_MODE", "REPLAY")
     cache_mode = os.environ.get("TOOL_CACHE_MODE", "READWRITE")
 
     ok = True
@@ -181,6 +181,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         print(f"OPENALEX_API_KEY=SET (file:{key_file})")
     else:
         print("OPENALEX_API_KEY=UNSET")
+    print("TIP: set PROVIDER_MODE=LIVE to enable real API calls")
     return 0 if ok else 1
 
 def cmd_live_smoke(args: argparse.Namespace) -> int:

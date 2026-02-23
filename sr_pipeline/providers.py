@@ -280,22 +280,30 @@ class CrossrefProvider(PaperProvider):
 
     def fetch_metadata(self, paper_id_or_url: str) -> Dict[str, Any]:
         doi = self._normalize_doi(paper_id_or_url)
+        payload = {"doi": doi}
+
+        if self.reliability.mode == "REPLAY":
+            h = hashlib.sha256(doi.encode("utf-8")).hexdigest()[:8]
+            response = {
+                "message": {
+                    "DOI": doi,
+                    "title": [f"Replay Crossref Title {h}"],
+                    "issued": {"date-parts": [[2024]]},
+                    "container-title": ["Replay Journal"],
+                    "author": [{"given": "Replay", "family": "Author"}],
+                }
+            }
+            meta = {
+                "status": "replay",
+                "status_code": 200,
+                "final_url": f"{self.base_url}/{doi}",
+                "attempts": [{"attempt": 1, "status_code": 200}],
+            }
+            artifact = self.reliability._build_artifact("lookup_work", payload, response, meta)
+            self.reliability._write_provider_artifact("lookup_work", artifact, is_error=False)
+            return artifact
 
         def _call():
-            if self.reliability.mode == "REPLAY":
-                h = hashlib.sha256(doi.encode("utf-8")).hexdigest()[:8]
-                response = {
-                    "message": {
-                        "DOI": doi,
-                        "title": [f"Replay Crossref Title {h}"],
-                        "issued": {"date-parts": [[2024]]},
-                        "container-title": ["Replay Journal"],
-                        "author": [{"given": "Replay", "family": "Author"}],
-                    }
-                }
-                meta = {"status": "replay", "status_code": 200, "final_url": f"{self.base_url}/{doi}", "attempts": [{"attempt": 1, "status_code": 200}]}
-                return response, meta
-
             url = f"{self.base_url}/{requests.utils.quote(doi, safe='')}"
             attempts: List[Dict[str, Any]] = []
             resp = requests.get(url, timeout=10)
@@ -317,7 +325,7 @@ class CrossrefProvider(PaperProvider):
                 "attempts": attempts,
             }
 
-        return self.reliability.call("lookup_work", {"doi": doi}, _call)
+        return self.reliability.call("lookup_work", payload, _call)
 
 class OpenAlexProvider(PaperProvider):
     def __init__(self):
