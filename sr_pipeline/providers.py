@@ -299,7 +299,15 @@ class CrossrefProvider(PaperProvider):
                 "final_url": f"{self.base_url}/{doi}",
                 "attempts": [{"attempt": 1, "status_code": 200}],
             }
-            artifact = self.reliability._build_artifact("lookup_work", payload, response, meta)
+            artifact = {
+                "provider": self.reliability.name,
+                "method": "lookup_work",
+                "payload": payload,
+                "response": response,
+                "meta": meta,
+                "timestamp": 0.0,
+                "sha256": self.reliability._canonical_sha256(response, meta),
+            }
             self.reliability._write_provider_artifact("lookup_work", artifact, is_error=False)
             return artifact
 
