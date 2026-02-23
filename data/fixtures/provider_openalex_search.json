@@ -1,0 +1,169 @@
+{
+  "meta": {
+    "count": 20,
+    "page": 1,
+    "per_page": 20
+  },
+  "results": [
+    {
+      "id": "https://openalex.org/W2000000000",
+      "display_name": "Test Paper 0",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/0.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000001",
+      "display_name": "Test Paper 1",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/1.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000002",
+      "display_name": "Test Paper 2",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/2.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000003",
+      "display_name": "Test Paper 3",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/3.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000004",
+      "display_name": "Test Paper 4",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/4.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000005",
+      "display_name": "Test Paper 5",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/5.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000006",
+      "display_name": "Test Paper 6",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/6.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000007",
+      "display_name": "Test Paper 7",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/7.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000008",
+      "display_name": "Test Paper 8",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/8.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000009",
+      "display_name": "Test Paper 9",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/9.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000010",
+      "display_name": "Test Paper 10",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/10.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000011",
+      "display_name": "Test Paper 11",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/11.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000012",
+      "display_name": "Test Paper 12",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/12.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000013",
+      "display_name": "Test Paper 13",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/13.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000014",
+      "display_name": "Test Paper 14",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/14.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000015",
+      "display_name": "Test Paper 15",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/15.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000016",
+      "display_name": "Test Paper 16",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/16.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000017",
+      "display_name": "Test Paper 17",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/17.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000018",
+      "display_name": "Test Paper 18",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/18.pdf"
+      }
+    },
+    {
+      "id": "https://openalex.org/W2000000019",
+      "display_name": "Test Paper 19",
+      "publication_year": 2023,
+      "open_access": {
+        "oa_url": "https://example.com/pdf/19.pdf"
+      }
+    }
+  ]
+}

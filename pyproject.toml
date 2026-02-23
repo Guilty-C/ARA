@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ara"
+version = "0.1.0"
+description = "ARA pipeline with CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.31.0",
+  "pypdf>=4.0.0"
+]
+
+[project.scripts]
+ara = "ara:main"
+
+[tool.setuptools]
+py-modules = ["ara"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sr_pipeline*"]

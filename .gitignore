@@ -1,0 +1,22 @@
+# Runtime artifacts
+outputs/
+outputs*/
+runs*/
+*.log
+*.zip
+server_debug.log
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+
+# Cache
+data/tool_cache/
+data/provider_cache/
+data/papers_cache/
+data/secrets/
+*.secret
+*.key

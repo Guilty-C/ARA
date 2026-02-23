@@ -1,0 +1,25 @@
+{"case_id": "MR001", "query": "industrial anomaly detection", "constraints": {"compute": "low"}, "gold_topics": ["anomaly detection", "industrial inspection"], "k": 5}
+{"case_id": "MR002", "query": "deep learning for time series", "constraints": {"compute": "high"}, "gold_topics": ["time series", "deep learning"], "k": 5}
+{"case_id": "MR003", "query": "large language models efficiency", "constraints": {"compute": "low"}, "gold_topics": ["llm efficiency", "model compression"], "k": 5}
+{"case_id": "MR004", "query": "reinforcement learning robotics", "constraints": {"compute": "high"}, "gold_topics": ["reinforcement learning", "robotics"], "k": 5}
+{"case_id": "MR005", "query": "computer vision medical imaging", "constraints": {"compute": "medium"}, "gold_topics": ["medical imaging", "computer vision"], "k": 5}
+{"case_id": "MR006", "query": "graph neural networks", "constraints": {"compute": "medium"}, "gold_topics": ["graph neural networks", "graph learning"], "k": 5}
+{"case_id": "MR007", "query": "federated learning privacy", "constraints": {"compute": "low"}, "gold_topics": ["federated learning", "privacy"], "k": 5}
+{"case_id": "MR008", "query": "generative adversarial networks", "constraints": {"compute": "high"}, "gold_topics": ["generative modeling", "adversarial training"], "k": 5}
+{"case_id": "MR009", "query": "explainable ai", "constraints": {"compute": "low"}, "gold_topics": ["explainable ai", "model interpretability"], "k": 5}
+{"case_id": "MR010", "query": "auto ml", "constraints": {"compute": "high"}, "gold_topics": ["auto ml", "hyperparameter optimization"], "k": 5}
+{"case_id": "MR011", "query": "few shot learning", "constraints": {"compute": "medium"}, "gold_topics": ["few shot learning", "meta learning"], "k": 5}
+{"case_id": "MR012", "query": "self supervised learning", "constraints": {"compute": "high"}, "gold_topics": ["self supervised learning", "representation learning"], "k": 5}
+{"case_id": "MR013", "query": "transformer models", "constraints": {"compute": "high"}, "gold_topics": ["transformer models", "attention"], "k": 5}
+{"case_id": "MR014", "query": "object detection", "constraints": {"compute": "medium"}, "gold_topics": ["object detection", "vision detection"], "k": 5}
+{"case_id": "MR015", "query": "semantic segmentation", "constraints": {"compute": "high"}, "gold_topics": ["semantic segmentation", "segmentation"], "k": 5}
+{"case_id": "MR016", "query": "recommender systems", "constraints": {"compute": "medium"}, "gold_topics": ["recommender systems", "recommendation"], "k": 5}
+{"case_id": "MR017", "query": "speech recognition", "constraints": {"compute": "high"}, "gold_topics": ["speech recognition", "asr"], "k": 5}
+{"case_id": "MR018", "query": "natural language generation", "constraints": {"compute": "high"}, "gold_topics": ["natural language generation", "text generation"], "k": 5}
+{"case_id": "MR019", "query": "sentiment analysis", "constraints": {"compute": "low"}, "gold_topics": ["sentiment analysis", "text classification"], "k": 5}
+{"case_id": "MR020", "query": "question answering", "constraints": {"compute": "medium"}, "gold_topics": ["question answering", "reading comprehension"], "k": 5}
+{"case_id": "MR021", "query": "knowledge graphs", "constraints": {"compute": "medium"}, "gold_topics": ["knowledge graphs", "relation extraction"], "k": 5}
+{"case_id": "MR022", "query": "transfer learning", "constraints": {"compute": "medium"}, "gold_topics": ["transfer learning", "domain adaptation"], "k": 5}
+{"case_id": "MR023", "query": "active learning", "constraints": {"compute": "low"}, "gold_topics": ["active learning", "query strategy"], "k": 5}
+{"case_id": "MR024", "query": "imitation learning", "constraints": {"compute": "medium"}, "gold_topics": ["imitation learning", "policy learning"], "k": 5}
+{"case_id": "MR025", "query": "multi agent systems", "constraints": {"compute": "high"}, "gold_topics": ["multi agent systems", "cooperative learning"], "k": 5}
