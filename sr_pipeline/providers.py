@@ -9,7 +9,7 @@ import requests
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 from sr_pipeline.tools import sanitize_untrusted_text
 from sr_pipeline.reliability import ReliabilityLayer, ReliabilityConfig, CircuitBreakerError
@@ -104,7 +104,7 @@ class ProviderReliabilityLayer(ReliabilityLayer):
         if isinstance(obj, dict):
             out = {}
             for k, v in obj.items():
-                if str(k).lower() == "api_key":
+                if str(k).lower() in {"api_key", "email", "unpaywall_email", "mailto"}:
                     out[k] = "<redacted>"
                 else:
                     out[k] = self._redact_secrets(v)
@@ -112,7 +112,10 @@ class ProviderReliabilityLayer(ReliabilityLayer):
         if isinstance(obj, list):
             return [self._redact_secrets(x) for x in obj]
         if isinstance(obj, str):
-            return re.sub(r"([?&]api_key=)[^&]+", r"\1<redacted>", obj, flags=re.IGNORECASE)
+            redacted = re.sub(r"([?&]api_key=)[^&]+", r"\1<redacted>", obj, flags=re.IGNORECASE)
+            redacted = re.sub(r"([?&]email=)[^&]+", r"\1<redacted>", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(r"([?&]mailto=)[^&]+", r"\1<redacted>", redacted, flags=re.IGNORECASE)
+            return redacted
         return obj
 
     def _write_provider_artifact(self, method_name: str, artifact: Dict[str, Any], is_error: bool = False):
@@ -329,11 +332,158 @@ class CrossrefProvider(PaperProvider):
 
         return self.reliability.call("lookup_work", payload, _call)
 
+class UnpaywallProvider(PaperProvider):
+    def __init__(self):
+        self.reliability = ProviderReliabilityLayer("unpaywall")
+        self.base_url = "https://api.unpaywall.org/v2"
+
+    @staticmethod
+    def _normalize_doi(doi: str) -> str:
+        value = (doi or "").strip()
+        value = re.sub(r"^https?://(dx\.)?doi\.org/", "", value, flags=re.IGNORECASE)
+        return value
+
+    @staticmethod
+    def _extract_rate_limit_headers(headers: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, value in headers.items():
+            k = str(key)
+            if "rate" in k.lower() or "limit" in k.lower() or "retry" in k.lower():
+                out[k] = value
+        return out
+
+    @staticmethod
+    def _redact_email_url(url: str) -> str:
+        return re.sub(r"([?&]email=)[^&]+", r"\1<redacted>", url, flags=re.IGNORECASE)
+
+    def resolve_paper_sources(self, config: Dict[str, Any]) -> List[PaperSource]:
+        return []
+
+    def fetch_pdf(self, source: PaperSource) -> Dict[str, Any]:
+        raise NotImplementedError("UnpaywallProvider does not fetch PDFs")
+
+    def fetch_metadata(self, paper_id_or_url: str) -> Dict[str, Any]:
+        doi = self._normalize_doi(paper_id_or_url)
+        payload = {"doi": doi}
+
+        if self.reliability.mode == "REPLAY":
+            h = hashlib.sha256(doi.encode("utf-8")).hexdigest()[:10]
+            response = {
+                "doi": doi,
+                "is_oa": True,
+                "best_oa_location": {
+                    "url": f"https://example.com/replay/{h}",
+                    "url_for_pdf": f"https://example.com/replay/{h}.pdf",
+                },
+                "oa_locations": [
+                    {
+                        "url": f"https://example.com/replay/{h}",
+                        "url_for_pdf": f"https://example.com/replay/{h}.pdf",
+                    }
+                ],
+            }
+            meta = {
+                "status": "replay",
+                "status_code": 200,
+                "final_url": f"{self.base_url}/{quote(doi, safe='')}?email=<redacted>",
+                "attempts": [{"attempt": 1, "status_code": 200}],
+                "rate_limit_headers": {},
+            }
+            artifact = self.reliability._build_artifact("lookup", payload, response, meta)
+            artifact["timestamp"] = 0.0
+            artifact["sha256"] = self.reliability._canonical_sha256(response, meta)
+            self.reliability._write_provider_artifact("lookup", artifact, is_error=False)
+            return artifact
+
+        def _call():
+            email = os.environ.get("UNPAYWALL_EMAIL", "").strip()
+            if not email:
+                raise ProviderCallError(
+                    "missing_unpaywall_email",
+                    meta={
+                        "status": "skipped",
+                        "stop_reason": "missing_unpaywall_email",
+                        "status_code": None,
+                        "attempts": [],
+                    },
+                )
+
+            url = f"{self.base_url}/{quote(doi, safe='')}"
+            params = {"email": email}
+            params_redacted = {"email": "<redacted>"}
+            max_attempts = 4
+            attempts: List[Dict[str, Any]] = []
+            last_status_code: Optional[int] = None
+            last_url = self._redact_email_url(f"{url}?email={email}")
+
+            for attempt in range(1, max_attempts + 1):
+                resp = requests.get(url, params=params, timeout=10)
+                last_status_code = resp.status_code
+                last_url = self._redact_email_url(resp.url)
+                rate_headers = self._extract_rate_limit_headers(resp.headers)
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "status_code": resp.status_code,
+                        "rate_limit_headers": rate_headers,
+                    }
+                )
+
+                if resp.status_code == 429 and attempt < max_attempts:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after is not None:
+                        try:
+                            wait_seconds = float(retry_after)
+                        except ValueError:
+                            wait_seconds = float(2 ** (attempt - 1))
+                    else:
+                        wait_seconds = float(2 ** (attempt - 1))
+                    time.sleep(wait_seconds)
+                    continue
+
+                if resp.status_code >= 400:
+                    raise ProviderCallError(
+                        f"unpaywall_http_{resp.status_code}",
+                        meta={
+                            "status": "http_error",
+                            "stop_reason": f"unpaywall_http_{resp.status_code}",
+                            "status_code": resp.status_code,
+                            "final_url": last_url,
+                            "attempts": attempts,
+                            "rate_limit_headers": rate_headers,
+                            "request": {"url": url, "params": params_redacted},
+                        },
+                    )
+
+                return resp.json(), {
+                    "status": "ok",
+                    "status_code": resp.status_code,
+                    "final_url": last_url,
+                    "attempts": attempts,
+                    "rate_limit_headers": rate_headers,
+                    "request": {"url": url, "params": params_redacted},
+                }
+
+            raise ProviderCallError(
+                "unpaywall_retry_exhausted",
+                meta={
+                    "status": "retry_exhausted",
+                    "stop_reason": "unpaywall_retry_exhausted",
+                    "status_code": last_status_code,
+                    "final_url": last_url,
+                    "attempts": attempts,
+                    "request": {"url": url, "params": params_redacted},
+                },
+            )
+
+        return self.reliability.call("lookup", payload, _call)
+
 class OpenAlexProvider(PaperProvider):
     def __init__(self):
         self.reliability = ProviderReliabilityLayer("openalex")
         self.base_url = "https://api.openalex.org/works"
         self.crossref = CrossrefProvider()
+        self.unpaywall = UnpaywallProvider()
 
     @staticmethod
     def _default_key_file() -> Path:
@@ -380,14 +530,48 @@ class OpenAlexProvider(PaperProvider):
                 # This is a simplification. Real OpenAlex search returns a list.
                 results = meta.get("response", {}).get("results", [])
                 for result in results:
+                    candidate_urls: List[str] = []
                     oa_url = result.get("open_access", {}).get("oa_url")
-                    if oa_url:
-                        sources.append(PaperSource(
-                            source_type="url", 
-                            path_or_url=oa_url,
-                            paper_id=result.get("id"),
-                            metadata=result
-                        ))
+                    if isinstance(oa_url, str) and oa_url.strip():
+                        candidate_urls.append(oa_url.strip())
+
+                    doi = self._extract_doi(result)
+                    if doi:
+                        try:
+                            unpaywall_artifact = self.unpaywall.fetch_metadata(doi)
+                            up_response = unpaywall_artifact.get("response", {})
+                            candidate_urls.extend(self._extract_unpaywall_urls(up_response))
+                        except ProviderCallError as exc:
+                            meta_info = exc.meta if isinstance(exc.meta, dict) else {}
+                            provenance = result.get("provenance", {})
+                            if not isinstance(provenance, dict):
+                                provenance = {}
+                            provenance["unpaywall_status"] = str(meta_info.get("status", "error"))
+                            provenance["unpaywall_stop_reason"] = str(
+                                meta_info.get("stop_reason", str(exc))
+                            )
+                            result["provenance"] = provenance
+                        except Exception as exc:
+                            provenance = result.get("provenance", {})
+                            if not isinstance(provenance, dict):
+                                provenance = {}
+                            provenance["unpaywall_status"] = "error"
+                            provenance["unpaywall_stop_reason"] = str(exc)
+                            result["provenance"] = provenance
+
+                    seen_urls = set()
+                    for candidate_url in candidate_urls:
+                        if candidate_url in seen_urls:
+                            continue
+                        seen_urls.add(candidate_url)
+                        sources.append(
+                            PaperSource(
+                                source_type="url",
+                                path_or_url=candidate_url,
+                                paper_id=result.get("id"),
+                                metadata=result,
+                            )
+                        )
                         
         return sources
 
@@ -410,6 +594,38 @@ class OpenAlexProvider(PaperProvider):
             if doi:
                 return str(doi)
         return ""
+
+    @staticmethod
+    def _extract_unpaywall_urls(unpaywall_response: Dict[str, Any]) -> List[str]:
+        urls: List[str] = []
+        if not isinstance(unpaywall_response, dict):
+            return urls
+
+        best = unpaywall_response.get("best_oa_location")
+        if isinstance(best, dict):
+            for key in ["url_for_pdf", "url"]:
+                value = best.get(key)
+                if isinstance(value, str) and value.strip():
+                    urls.append(value.strip())
+
+        locations = unpaywall_response.get("oa_locations", [])
+        if isinstance(locations, list):
+            for loc in locations:
+                if not isinstance(loc, dict):
+                    continue
+                for key in ["url_for_pdf", "url"]:
+                    value = loc.get(key)
+                    if isinstance(value, str) and value.strip():
+                        urls.append(value.strip())
+
+        out: List[str] = []
+        seen = set()
+        for url in urls:
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append(url)
+        return out
 
     @staticmethod
     def _extract_year_from_crossref(msg: Dict[str, Any]) -> Optional[int]:
@@ -613,6 +829,7 @@ class OpenAlexProvider(PaperProvider):
             }
 
     def _fetch_url(self, url: str) -> Dict[str, Any]:
+        payload = {"url": url}
         # 0. Check Replay Mode
         if self.reliability.mode == "REPLAY":
             # Return a stub for replay
@@ -659,6 +876,22 @@ class OpenAlexProvider(PaperProvider):
             cache_key = hashlib.sha256(f"pdf_fetch:{url}".encode()).hexdigest()
             meta_path = cache_dir / f"pdf_fetch_{cache_key}.json"
             meta_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            replay_artifact = self.reliability._build_artifact(
+                "fetch_pdf",
+                payload,
+                result,
+                {
+                    "status": "replay",
+                    "cache_hit": False,
+                    "stop_reason": "none",
+                },
+            )
+            replay_artifact["timestamp"] = 0.0
+            replay_artifact["sha256"] = self.reliability._canonical_sha256(
+                replay_artifact.get("response", {}),
+                replay_artifact.get("meta", {}),
+            )
+            self.reliability._write_provider_artifact("fetch_pdf", replay_artifact, is_error=False)
             
             # Log event
             self.reliability._log_event("fetch_pdf", {"url": url}, True, cache_hit=False)
@@ -684,6 +917,17 @@ class OpenAlexProvider(PaperProvider):
                 if Path(meta["local_path"]).exists():
                     # Log hit
                     self.reliability._log_event("fetch_pdf", {"url": url}, True, cache_hit=True)
+                    cache_artifact = self.reliability._build_artifact(
+                        "fetch_pdf",
+                        payload,
+                        meta,
+                        {
+                            "status": "cache_hit",
+                            "cache_hit": True,
+                            "stop_reason": "none",
+                        },
+                    )
+                    self.reliability._write_provider_artifact("fetch_pdf", cache_artifact, is_error=False)
                     return meta
             except:
                 pass
@@ -691,8 +935,76 @@ class OpenAlexProvider(PaperProvider):
         # 2. Download
         try:
             start_ts = time.time()
-            response = requests.get(url, stream=True, timeout=20)
-            response.raise_for_status()
+            max_attempts_429 = 4
+            attempts: List[Dict[str, Any]] = []
+            response = None
+            for attempt in range(1, max_attempts_429 + 1):
+                response = requests.get(url, stream=True, timeout=20)
+                rate_headers = self._extract_rate_limit_headers(response.headers)
+                attempts.append(
+                    {
+                        "attempt": attempt,
+                        "status_code": response.status_code,
+                        "rate_limit_headers": rate_headers,
+                    }
+                )
+                if response.status_code == 429 and attempt < max_attempts_429:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after is not None:
+                        try:
+                            wait_seconds = float(retry_after)
+                        except ValueError:
+                            wait_seconds = float(2 ** (attempt - 1))
+                    else:
+                        wait_seconds = float(2 ** (attempt - 1))
+                    time.sleep(wait_seconds)
+                    continue
+                break
+
+            if response is None:
+                raise ProviderCallError(
+                    "pdf_download_no_response",
+                    meta={"status": "error", "stop_reason": "pdf_download_no_response"},
+                )
+
+            if response.status_code in (403, 404):
+                raise ProviderCallError(
+                    f"pdf_download_http_{response.status_code}",
+                    meta={
+                        "status": "http_error",
+                        "stop_reason": f"pdf_download_http_{response.status_code}",
+                        "status_code": response.status_code,
+                        "final_url": response.url,
+                        "attempts": attempts,
+                        "rate_limit_headers": self._extract_rate_limit_headers(response.headers),
+                    },
+                )
+
+            if response.status_code == 429:
+                raise ProviderCallError(
+                    "pdf_download_http_429",
+                    meta={
+                        "status": "retry_exhausted",
+                        "stop_reason": "pdf_download_http_429",
+                        "status_code": 429,
+                        "final_url": response.url,
+                        "attempts": attempts,
+                        "rate_limit_headers": self._extract_rate_limit_headers(response.headers),
+                    },
+                )
+
+            if response.status_code >= 400:
+                raise ProviderCallError(
+                    f"pdf_download_http_{response.status_code}",
+                    meta={
+                        "status": "http_error",
+                        "stop_reason": f"pdf_download_http_{response.status_code}",
+                        "status_code": response.status_code,
+                        "final_url": response.url,
+                        "attempts": attempts,
+                        "rate_limit_headers": self._extract_rate_limit_headers(response.headers),
+                    },
+                )
             
             # Stream to temp file and compute hash
             hasher = hashlib.sha256()
@@ -725,6 +1037,20 @@ class OpenAlexProvider(PaperProvider):
             
             # Write metadata artifact
             meta_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            success_artifact = self.reliability._build_artifact(
+                "fetch_pdf",
+                payload,
+                result,
+                {
+                    "status": "ok",
+                    "stop_reason": "none",
+                    "status_code": response.status_code,
+                    "final_url": response.url,
+                    "attempts": attempts,
+                    "rate_limit_headers": self._extract_rate_limit_headers(response.headers),
+                },
+            )
+            self.reliability._write_provider_artifact("fetch_pdf", success_artifact, is_error=False)
             
             self.reliability._log_event("fetch_pdf", {"url": url}, True, latency_ms=(time.time()-start_ts)*1000)
             
@@ -732,6 +1058,25 @@ class OpenAlexProvider(PaperProvider):
             
         except Exception as e:
             self.reliability._log_event("fetch_pdf", {"url": url}, False, error=str(e))
+            error_meta = {}
+            if hasattr(e, "meta") and isinstance(getattr(e, "meta"), dict):
+                error_meta = getattr(e, "meta")
+            if "stop_reason" not in error_meta:
+                error_meta["stop_reason"] = str(e)
+            error_artifact = {
+                "provider": self.reliability.name,
+                "method": "fetch_pdf",
+                "payload": payload,
+                "response": {},
+                "meta": error_meta,
+                "status": "error",
+                "error": str(e),
+                "timestamp": time.time(),
+            }
+            error_artifact["sha256"] = hashlib.sha256(
+                json.dumps(error_artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            self.reliability._write_provider_artifact("fetch_pdf", error_artifact, is_error=True)
             raise e
 
     def _compute_sha256(self, path: Path) -> str:
@@ -745,4 +1090,6 @@ class OpenAlexProvider(PaperProvider):
 def get_provider(name: str = "openalex") -> PaperProvider:
     if name == "openalex":
         return OpenAlexProvider()
+    if name == "unpaywall":
+        return UnpaywallProvider()
     raise ValueError(f"Unknown provider: {name}")

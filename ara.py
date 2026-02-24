@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from urllib import request, error
 
-from sr_pipeline.providers import OpenAlexProvider
+from sr_pipeline.providers import OpenAlexProvider, UnpaywallProvider
 
 
 def _resolve_run_id(output_dir: Path) -> str:
@@ -181,6 +181,11 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         print(f"OPENALEX_API_KEY=SET (file:{key_file})")
     else:
         print("OPENALEX_API_KEY=UNSET")
+    unpaywall_email = os.environ.get("UNPAYWALL_EMAIL", "").strip()
+    if unpaywall_email:
+        print("UNPAYWALL_EMAIL=SET (env)")
+    else:
+        print("UNPAYWALL_EMAIL=UNSET")
     print("TIP: set PROVIDER_MODE=LIVE to enable real API calls")
     return 0 if ok else 1
 
@@ -263,6 +268,90 @@ def cmd_live_smoke(args: argparse.Namespace) -> int:
         print(f"LIVE_SMOKE_RESULT={json.dumps(result, ensure_ascii=False)}")
         return 1
 
+def _extract_unpaywall_urls(payload: dict) -> list[str]:
+    urls: list[str] = []
+    if not isinstance(payload, dict):
+        return urls
+    best = payload.get("best_oa_location")
+    if isinstance(best, dict):
+        for key in ["url_for_pdf", "url"]:
+            value = best.get(key)
+            if isinstance(value, str) and value.strip():
+                urls.append(value.strip())
+    locs = payload.get("oa_locations", [])
+    if isinstance(locs, list):
+        for loc in locs:
+            if not isinstance(loc, dict):
+                continue
+            for key in ["url_for_pdf", "url"]:
+                value = loc.get(key)
+                if isinstance(value, str) and value.strip():
+                    urls.append(value.strip())
+    out: list[str] = []
+    seen = set()
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+def cmd_unpaywall_smoke(args: argparse.Namespace) -> int:
+    mode = (args.mode or os.environ.get("PROVIDER_MODE", "REPLAY")).upper()
+    os.environ["PROVIDER_MODE"] = mode
+    os.environ["OUTPUT_DIR"] = args.output_dir
+    os.environ.setdefault("PROVIDER_ARTIFACT_DEBUG", "1")
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    if mode == "LIVE" and not os.environ.get("UNPAYWALL_EMAIL", "").strip():
+        result = {
+            "final_verdict": "SKIP",
+            "status": "skipped",
+            "stop_reason": "missing_unpaywall_email",
+            "mode": mode,
+            "doi": args.doi,
+            "oa_urls": [],
+        }
+        print(f"UNPAYWALL_SMOKE_RESULT={json.dumps(result, ensure_ascii=False)}")
+        return 0
+
+    try:
+        provider = UnpaywallProvider()
+        artifact = provider.fetch_metadata(args.doi)
+        response = artifact.get("response", {}) if isinstance(artifact, dict) else {}
+        oa_urls = _extract_unpaywall_urls(response if isinstance(response, dict) else {})
+        verdict = "PASS" if oa_urls else "FAIL"
+        result = {
+            "final_verdict": verdict,
+            "status": "ok" if verdict == "PASS" else "no_oa_url",
+            "stop_reason": "none" if verdict == "PASS" else "no_oa_url",
+            "mode": mode,
+            "doi": args.doi,
+            "oa_urls": oa_urls,
+            "provider": artifact.get("provider"),
+            "method": artifact.get("method"),
+            "sha256": artifact.get("sha256"),
+        }
+        print(f"UNPAYWALL_SMOKE_RESULT={json.dumps(result, ensure_ascii=False)}")
+        return 0 if verdict == "PASS" else 1
+    except Exception as exc:
+        status = "error"
+        stop_reason = str(exc)
+        if hasattr(exc, "meta") and isinstance(getattr(exc, "meta"), dict):
+            meta = getattr(exc, "meta")
+            status = str(meta.get("status", status))
+            stop_reason = str(meta.get("stop_reason", stop_reason))
+        result = {
+            "final_verdict": "FAIL",
+            "status": status,
+            "stop_reason": stop_reason,
+            "mode": mode,
+            "doi": args.doi,
+            "oa_urls": [],
+        }
+        print(f"UNPAYWALL_SMOKE_RESULT={json.dumps(result, ensure_ascii=False)}")
+        return 1
+
 def cmd_set_openalex_key(args: argparse.Namespace) -> int:
     key_file = Path(args.key_file)
     key_value = args.key
@@ -316,6 +405,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_live_smoke.add_argument("--mode", choices=["REPLAY", "LIVE"])
     p_live_smoke.add_argument("--output-dir", default="outputs_live_smoke")
     p_live_smoke.set_defaults(func=cmd_live_smoke)
+
+    p_unpaywall_smoke = sub.add_parser("unpaywall-smoke")
+    p_unpaywall_smoke.add_argument("--doi", required=True)
+    p_unpaywall_smoke.add_argument("--mode", choices=["REPLAY", "LIVE"])
+    p_unpaywall_smoke.add_argument("--output-dir", default="outputs_unpaywall_smoke")
+    p_unpaywall_smoke.set_defaults(func=cmd_unpaywall_smoke)
 
     p_set_key = sub.add_parser("set-openalex-key")
     p_set_key.add_argument("--key-file", default="data/secrets/openalex_api_key.txt")

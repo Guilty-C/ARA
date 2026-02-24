@@ -169,6 +169,7 @@ class LiteratureStage:
     def run(self, st: ResearchState, tools: ToolRegistry, api: Optional[APIClient] = None) -> ResearchState:
         # Level-2: RAG-first literature review
         from sr_pipeline.literature.agent import LiteratureReviewAgent
+        from sr_pipeline.providers import get_provider
         from pathlib import Path
         import json
         import os
@@ -190,6 +191,27 @@ class LiteratureStage:
                     sources.extend(env_sources.split(","))
                 else:
                     sources.append(env_sources)
+
+        # Provider-driven discovery (OpenAlex + optional Unpaywall DOI OA lookup)
+        if st.topic:
+            try:
+                provider = get_provider("openalex")
+                provider_sources = provider.resolve_paper_sources({"topics": [st.topic]})
+                for ps in provider_sources:
+                    if getattr(ps, "source_type", "") == "url" and getattr(ps, "path_or_url", ""):
+                        sources.append(ps.path_or_url)
+            except Exception as e:
+                print(f"LiteratureStage: provider source discovery degraded: {e}")
+
+        # Keep source order deterministic while deduplicating.
+        deduped_sources = []
+        seen_sources = set()
+        for src in sources:
+            if src in seen_sources:
+                continue
+            seen_sources.add(src)
+            deduped_sources.append(src)
+        sources = deduped_sources
 
         agent = LiteratureReviewAgent(sources)
         results = agent.run(st.topic or "Research")

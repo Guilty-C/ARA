@@ -7,7 +7,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from sr_pipeline.providers import get_provider, PaperSource
+from sr_pipeline.providers import get_provider, PaperSource, ProviderCallError
 
 # Milestone 1: Untrusted content boundary
 from sr_pipeline.tools import sanitize_untrusted_text
@@ -55,6 +55,7 @@ def paper_fetch(sources: List[str], cache_dir: str = "data/papers_cache") -> Lis
             
     results = []
     provider = get_provider()
+    fail_fast = os.environ.get("FAIL_FAST", "0") == "1" or os.environ.get("FAIL_FAST_TOOL", "0") == "1"
     print(f"DEBUG: paper_fetch called with {len(sources)} sources")
     
     for src in sources:
@@ -80,10 +81,15 @@ def paper_fetch(sources: List[str], cache_dir: str = "data/papers_cache") -> Lis
                 }
                 manifest[paper_id] = entry
                 results.append(entry)
+            except ProviderCallError as e:
+                stop_reason = str(e.meta.get("stop_reason")) if isinstance(e.meta, dict) else str(e)
+                print(f"Failed to fetch URL {src}: {stop_reason}")
+                if fail_fast:
+                    raise
             except Exception as e:
-                # In a real pipeline, we might want to fail hard or log warning
-                # For now, let's log and skip
                 print(f"Failed to fetch URL {src}: {e}")
+                if fail_fast:
+                    raise
             continue
             
         src_path = Path(src)

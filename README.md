@@ -68,16 +68,25 @@ Optional variables:
 - `OPENALEX_API_KEY`: required in `LIVE` mode (highest priority).
 - `OPENALEX_API_KEY_FILE`: optional key file path, default `data/secrets/openalex_api_key.txt`.
 - `OPENALEX_MAILTO`: optional OpenAlex `mailto` parameter.
+- `UNPAYWALL_EMAIL`: required for Unpaywall lookup in `LIVE` mode (`https://api.unpaywall.org/v2/<doi>?email=...`).
 
 Acceptance commands:
 ```bash
 python -m ara live-smoke --mode REPLAY --min-works 10
 PROVIDER_MODE=LIVE OPENALEX_API_KEY=... python -m ara live-smoke --mode LIVE --min-works 10
+python -m ara unpaywall-smoke --mode REPLAY --doi 10.1038/s41586-020-2649-2
+PROVIDER_MODE=LIVE UNPAYWALL_EMAIL=... python -m ara unpaywall-smoke --mode LIVE --doi 10.1038/s41586-020-2649-2
 python -m ara set-openalex-key
 PROVIDER_MODE=LIVE python -m ara live-smoke --mode LIVE --min-works 10
 ```
 
-Key file mode is recommended for local usage. Do not commit key files to git. The default path `data/secrets/` is ignored by `.gitignore`.
+Key file mode is recommended for local usage. Do not commit API keys/emails/secrets to git. The default path `data/secrets/` is ignored by `.gitignore`.
+
+### PDF Download Failure Policy
+- DOI lookup chain: OpenAlex work DOI -> Unpaywall OA URL candidates (`best_oa_location.url_for_pdf/url`, then `oa_locations[*].url_for_pdf/url`) -> `fetch_pdf`.
+- HTTP `403/404` on PDF download: mark `stop_reason=pdf_download_http_403/404`, degrade to next candidate URL.
+- HTTP `429` on PDF download: retry with `Retry-After` first, else exponential backoff `1/2/4/8` seconds; if exhausted mark `stop_reason=pdf_download_http_429`.
+- If all candidates fail: continue in degraded mode by default; set `FAIL_FAST=1` (or `FAIL_FAST_TOOL=1`) to fail fast.
 
 ## Architecture & Endpoints
 
