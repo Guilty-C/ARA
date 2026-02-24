@@ -352,6 +352,91 @@ def cmd_unpaywall_smoke(args: argparse.Namespace) -> int:
         print(f"UNPAYWALL_SMOKE_RESULT={json.dumps(result, ensure_ascii=False)}")
         return 1
 
+def cmd_net_smoke(args: argparse.Namespace) -> int:
+    mode = (args.mode or os.environ.get("PROVIDER_MODE", "REPLAY")).upper()
+    os.environ["PROVIDER_MODE"] = mode
+    os.environ["OUTPUT_DIR"] = args.output_dir
+    os.environ.setdefault("PROVIDER_ARTIFACT_DEBUG", "1")
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    result = {
+        "mode": mode,
+        "openalex": {"verdict": "SKIP", "status": "skipped", "stop_reason": "not_run", "sha256": None},
+        "unpaywall": {"verdict": "SKIP", "status": "skipped", "stop_reason": "not_run", "sha256": None},
+    }
+
+    openalex_key_present = bool(OpenAlexProvider._read_secret_key())
+    if mode != "LIVE" or openalex_key_present:
+        try:
+            oa = OpenAlexProvider()
+            artifact = oa.fetch_metadata(args.query, per_page=10)
+            works = artifact.get("response", {}).get("results", []) if isinstance(artifact, dict) else []
+            ok = isinstance(works, list) and len(works) > 0
+            result["openalex"] = {
+                "verdict": "PASS" if ok else "FAIL",
+                "status": "ok" if ok else "empty_results",
+                "stop_reason": "none" if ok else "empty_results",
+                "sha256": artifact.get("sha256") if isinstance(artifact, dict) else None,
+            }
+        except Exception as exc:
+            status = "error"
+            stop_reason = str(exc)
+            if hasattr(exc, "meta") and isinstance(getattr(exc, "meta"), dict):
+                meta = getattr(exc, "meta")
+                status = str(meta.get("status", status))
+                stop_reason = str(meta.get("stop_reason", stop_reason))
+            result["openalex"] = {
+                "verdict": "FAIL",
+                "status": status,
+                "stop_reason": stop_reason,
+                "sha256": None,
+            }
+    else:
+        result["openalex"] = {
+            "verdict": "SKIP",
+            "status": "skipped",
+            "stop_reason": "missing_openalex_api_key",
+            "sha256": None,
+        }
+
+    unpaywall_email_present = bool(os.environ.get("UNPAYWALL_EMAIL", "").strip())
+    if mode != "LIVE" or unpaywall_email_present:
+        try:
+            up = UnpaywallProvider()
+            artifact = up.fetch_metadata(args.doi)
+            oa_urls = _extract_unpaywall_urls(artifact.get("response", {}) if isinstance(artifact, dict) else {})
+            ok = len(oa_urls) > 0
+            result["unpaywall"] = {
+                "verdict": "PASS" if ok else "FAIL",
+                "status": "ok" if ok else "no_oa_url",
+                "stop_reason": "none" if ok else "no_oa_url",
+                "sha256": artifact.get("sha256") if isinstance(artifact, dict) else None,
+            }
+        except Exception as exc:
+            status = "error"
+            stop_reason = str(exc)
+            if hasattr(exc, "meta") and isinstance(getattr(exc, "meta"), dict):
+                meta = getattr(exc, "meta")
+                status = str(meta.get("status", status))
+                stop_reason = str(meta.get("stop_reason", stop_reason))
+            result["unpaywall"] = {
+                "verdict": "FAIL",
+                "status": status,
+                "stop_reason": stop_reason,
+                "sha256": None,
+            }
+    else:
+        result["unpaywall"] = {
+            "verdict": "SKIP",
+            "status": "skipped",
+            "stop_reason": "missing_unpaywall_email",
+            "sha256": None,
+        }
+
+    print(f"NET_SMOKE_RESULT={json.dumps(result, ensure_ascii=False)}")
+    has_fail = any(x.get("verdict") == "FAIL" for x in [result["openalex"], result["unpaywall"]])
+    return 1 if has_fail else 0
+
 def cmd_set_openalex_key(args: argparse.Namespace) -> int:
     key_file = Path(args.key_file)
     key_value = args.key
@@ -411,6 +496,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_unpaywall_smoke.add_argument("--mode", choices=["REPLAY", "LIVE"])
     p_unpaywall_smoke.add_argument("--output-dir", default="outputs_unpaywall_smoke")
     p_unpaywall_smoke.set_defaults(func=cmd_unpaywall_smoke)
+
+    p_net_smoke = sub.add_parser("net-smoke")
+    p_net_smoke.add_argument("--mode", choices=["REPLAY", "LIVE"])
+    p_net_smoke.add_argument("--output-dir", default="outputs_net_smoke")
+    p_net_smoke.add_argument("--query", default="industrial anomaly detection")
+    p_net_smoke.add_argument("--doi", default="10.1038/s41586-020-2649-2")
+    p_net_smoke.set_defaults(func=cmd_net_smoke)
 
     p_set_key = sub.add_parser("set-openalex-key")
     p_set_key.add_argument("--key-file", default="data/secrets/openalex_api_key.txt")

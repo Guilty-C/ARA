@@ -27,6 +27,72 @@ class ProviderCallError(Exception):
         super().__init__(message)
         self.meta = meta or {}
 
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    if os.environ.get("PROVIDER_DISABLE_PROXY", "").strip() == "1":
+        session.trust_env = False
+    return session
+
+def _summarize_proxy_value(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = urlparse(value if "://" in value else f"http://{value}")
+        scheme = parsed.scheme or "http"
+        host = parsed.hostname or ""
+        port = parsed.port
+        if not host:
+            return "<set>"
+        has_userinfo = ("@" in (parsed.netloc or "")) or bool(parsed.username) or bool(parsed.password)
+        summary = f"{scheme}://"
+        if has_userinfo:
+            summary += "<redacted>@"
+        summary += host
+        if port:
+            summary += f":{port}"
+        return summary
+    except Exception:
+        return "<set>"
+
+def _proxy_env_summary() -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]:
+        raw = os.environ.get(key, "").strip()
+        out[key] = {
+            "is_set": bool(raw),
+            "summary": _summarize_proxy_value(raw) if raw else "",
+        }
+    return out
+
+def _network_error_meta(provider_tag: str, stop_reason: str, exc: Exception) -> Dict[str, Any]:
+    return {
+        "status": "net_error",
+        "stop_reason": stop_reason,
+        "exception_class": exc.__class__.__name__,
+        "exception_repr": repr(exc),
+        "proxy_env_summary": _proxy_env_summary(),
+        "provider": provider_tag,
+    }
+
+def _session_get(session: requests.Session, provider_tag: str, url: str, **kwargs):
+    try:
+        return session.get(url, **kwargs)
+    except requests.exceptions.ProxyError as exc:
+        raise ProviderCallError(
+            f"{provider_tag}_net_error",
+            meta=_network_error_meta(provider_tag, f"{provider_tag}_proxy_error", exc),
+        )
+    except requests.exceptions.Timeout as exc:
+        raise ProviderCallError(
+            f"{provider_tag}_net_error",
+            meta=_network_error_meta(provider_tag, f"{provider_tag}_timeout", exc),
+        )
+    except requests.exceptions.ConnectionError as exc:
+        raise ProviderCallError(
+            f"{provider_tag}_net_error",
+            meta=_network_error_meta(provider_tag, f"{provider_tag}_connection_error", exc),
+        )
+
 class ProviderReliabilityLayer(ReliabilityLayer):
     """
     Enforces timeout, circuit breaker, and caching for provider calls.
@@ -115,6 +181,7 @@ class ProviderReliabilityLayer(ReliabilityLayer):
             redacted = re.sub(r"([?&]api_key=)[^&]+", r"\1<redacted>", obj, flags=re.IGNORECASE)
             redacted = re.sub(r"([?&]email=)[^&]+", r"\1<redacted>", redacted, flags=re.IGNORECASE)
             redacted = re.sub(r"([?&]mailto=)[^&]+", r"\1<redacted>", redacted, flags=re.IGNORECASE)
+            redacted = re.sub(r"://[^/\s@]+@", "://<redacted>@", redacted)
             return redacted
         return obj
 
@@ -268,6 +335,7 @@ class CrossrefProvider(PaperProvider):
     def __init__(self):
         self.reliability = ProviderReliabilityLayer("crossref")
         self.base_url = "https://api.crossref.org/works"
+        self.session = _make_session()
 
     @staticmethod
     def _normalize_doi(doi: str) -> str:
@@ -311,7 +379,7 @@ class CrossrefProvider(PaperProvider):
         def _call():
             url = f"{self.base_url}/{requests.utils.quote(doi, safe='')}"
             attempts: List[Dict[str, Any]] = []
-            resp = requests.get(url, timeout=10)
+            resp = _session_get(self.session, "crossref", url, timeout=10)
             attempts.append({"attempt": 1, "status_code": resp.status_code})
             if resp.status_code >= 400:
                 raise ProviderCallError(
@@ -336,6 +404,7 @@ class UnpaywallProvider(PaperProvider):
     def __init__(self):
         self.reliability = ProviderReliabilityLayer("unpaywall")
         self.base_url = "https://api.unpaywall.org/v2"
+        self.session = _make_session()
 
     @staticmethod
     def _normalize_doi(doi: str) -> str:
@@ -417,7 +486,7 @@ class UnpaywallProvider(PaperProvider):
             last_url = self._redact_email_url(f"{url}?email={email}")
 
             for attempt in range(1, max_attempts + 1):
-                resp = requests.get(url, params=params, timeout=10)
+                resp = _session_get(self.session, "unpaywall", url, params=params, timeout=10)
                 last_status_code = resp.status_code
                 last_url = self._redact_email_url(resp.url)
                 rate_headers = self._extract_rate_limit_headers(resp.headers)
@@ -484,6 +553,7 @@ class OpenAlexProvider(PaperProvider):
         self.base_url = "https://api.openalex.org/works"
         self.crossref = CrossrefProvider()
         self.unpaywall = UnpaywallProvider()
+        self.session = _make_session()
 
     @staticmethod
     def _default_key_file() -> Path:
@@ -744,7 +814,7 @@ class OpenAlexProvider(PaperProvider):
 
             for retry_idx in range(max_retries + 1):
                 attempt_count += 1
-                resp = requests.get(self.base_url, params=params, timeout=10)
+                resp = _session_get(self.session, "openalex", self.base_url, params=params, timeout=10)
                 last_status_code = resp.status_code
                 last_url = self._redact_url_api_key(resp.url)
                 rate_headers = self._extract_rate_limit_headers(resp.headers)
@@ -939,7 +1009,7 @@ class OpenAlexProvider(PaperProvider):
             attempts: List[Dict[str, Any]] = []
             response = None
             for attempt in range(1, max_attempts_429 + 1):
-                response = requests.get(url, stream=True, timeout=20)
+                response = _session_get(self.session, "pdf", url, stream=True, timeout=20)
                 rate_headers = self._extract_rate_limit_headers(response.headers)
                 attempts.append(
                     {

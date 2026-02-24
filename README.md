@@ -88,6 +88,11 @@ Key file mode is recommended for local usage. Do not commit API keys/emails/secr
 - HTTP `429` on PDF download: retry with `Retry-After` first, else exponential backoff `1/2/4/8` seconds; if exhausted mark `stop_reason=pdf_download_http_429`.
 - If all candidates fail: continue in degraded mode by default; set `FAIL_FAST=1` (or `FAIL_FAST_TOOL=1`) to fail fast.
 
+### LIVE Network Troubleshooting
+- If artifacts show connection refused/proxy errors, check `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`.
+- A common misconfiguration is proxy variables pointing to a local port where no proxy is running.
+- You can temporarily bypass system proxy settings for provider calls with `PROVIDER_DISABLE_PROXY=1`.
+
 ## Architecture & Endpoints
 
 The system connects to external services via two main portholes. The included `dummy_tool_server.py` implements both for testing.
