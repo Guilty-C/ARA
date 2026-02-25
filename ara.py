@@ -789,6 +789,19 @@ def cmd_live_smoke(args: argparse.Namespace) -> int:
         response = artifact.get("response", {}) if isinstance(artifact, dict) else {}
         works = response.get("results", []) if isinstance(response, dict) else []
         n_works = len(works) if isinstance(works, list) else 0
+        top3 = []
+        try:
+            mapped = provider.map_search_results(artifact)
+            top3 = [
+                {
+                    "id": row.get("id"),
+                    "title": row.get("title"),
+                    "year": row.get("publication_year"),
+                }
+                for row in mapped[:3]
+            ]
+        except Exception:
+            top3 = []
 
         if n_works >= args.min_works:
             result = {
@@ -802,8 +815,11 @@ def cmd_live_smoke(args: argparse.Namespace) -> int:
                 "provider": artifact.get("provider"),
                 "method": artifact.get("method"),
                 "sha256": artifact.get("sha256"),
+                "top3": top3,
             }
             print(f"LIVE_SMOKE_RESULT={json.dumps(result, ensure_ascii=False)}")
+            for row in top3:
+                print(f"OPENALEX_TOP3 id={row.get('id')} year={row.get('year')} title={row.get('title')}")
             return 0
 
         result = {
@@ -817,8 +833,11 @@ def cmd_live_smoke(args: argparse.Namespace) -> int:
             "provider": artifact.get("provider"),
             "method": artifact.get("method"),
             "sha256": artifact.get("sha256"),
+            "top3": top3,
         }
         print(f"LIVE_SMOKE_RESULT={json.dumps(result, ensure_ascii=False)}")
+        for row in top3:
+            print(f"OPENALEX_TOP3 id={row.get('id')} year={row.get('year')} title={row.get('title')}")
         return 1
     except Exception as exc:
         status = "error"

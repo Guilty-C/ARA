@@ -46,6 +46,15 @@ python -m ara run --mode LIVE --output-dir outputs_e2e/live_run --config outputs
 python -m ara report outputs_e2e/live_run
 ```
 
+### OpenAlex live notes
+
+- Get your OpenAlex API key from `openalex.org/settings/api`.
+- Set `OPENALEX_API_KEY` before any `LIVE` run.
+- Default mode is `REPLAY` (offline replay fixtures, deterministic, CI-safe).
+- Manual live smoke (not for CI):
+  - `python -m ara live-smoke --mode LIVE --query "machine learning" --min-works 3 --output-dir outputs_e2e/openalex_live_smoke`
+  - On success it prints top 3 `(id, title, year)` rows.
+
 ### PowerShell
 ```powershell
 $env:OPENALEX_API_KEY='your_openalex_key'

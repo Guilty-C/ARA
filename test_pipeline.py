@@ -2694,6 +2694,58 @@ def run_secrets_leak_scan_test():
     }
 
 
+def run_openalex_offline_replay_test():
+    print("--- Running OpenAlex Offline Replay Test ---")
+    import sr_pipeline.providers as providers_mod
+
+    old_mode = os.environ.get("PROVIDER_MODE")
+    os.environ["PROVIDER_MODE"] = "REPLAY"
+    original_session_get = providers_mod._session_get
+
+    def _blocked_network(*args, **kwargs):
+        raise AssertionError("network_call_in_offline_mode")
+
+    providers_mod._session_get = _blocked_network
+    try:
+        provider = providers_mod.OpenAlexProvider()
+        rows_1 = provider.search_works("machine learning", per_page=10)
+        rows_2 = provider.search_works("machine learning", per_page=10)
+    except Exception as exc:
+        return {"pass": False, "error": str(exc)}
+    finally:
+        providers_mod._session_get = original_session_get
+        if old_mode is None:
+            os.environ.pop("PROVIDER_MODE", None)
+        else:
+            os.environ["PROVIDER_MODE"] = old_mode
+
+    if not isinstance(rows_1, list) or len(rows_1) == 0:
+        return {"pass": False, "error": "empty_rows"}
+
+    required = ["id", "title", "publication_year", "doi", "cited_by_count", "authors"]
+    for row in rows_1:
+        if not isinstance(row, dict):
+            return {"pass": False, "error": "non_dict_row"}
+        for k in required:
+            if k not in row:
+                return {"pass": False, "error": f"missing_field:{k}"}
+
+    sorted_rows = sorted(rows_1, key=lambda r: (-int(r.get("cited_by_count", 0)), str(r.get("id", ""))))
+    stable_order = rows_1 == sorted_rows
+    deterministic = rows_1 == rows_2
+    if not stable_order:
+        return {"pass": False, "error": "unstable_sort_order"}
+    if not deterministic:
+        return {"pass": False, "error": "non_deterministic_results"}
+
+    sample = [{"id": r.get("id"), "title": r.get("title")} for r in rows_1[:3]]
+    return {
+        "pass": True,
+        "count": len(rows_1),
+        "sample_top3": sample,
+    }
+
+
 def main():
     minireal = run_minireal_quality_gate_test()
     leakage = run_leakage_controlled_fail_test()
@@ -2706,6 +2758,7 @@ def main():
     scorer_det = run_scorer_determinism_test()
     evidence_gate = run_evidence_gate_test()
     secrets_scan = run_secrets_leak_scan_test()
+    openalex_offline = run_openalex_offline_replay_test()
 
     score = 10
     if not minireal.get("pass"):
@@ -2731,6 +2784,8 @@ def main():
     if not evidence_gate.get("pass"):
         score -= 2
     if not secrets_scan.get("pass"):
+        score -= 2
+    if not openalex_offline.get("pass"):
         score -= 2
     if score < 0:
         score = 0
@@ -2772,6 +2827,7 @@ def main():
         },
         "milestone11": {
             "secrets_leak_scan": bool(secrets_scan.get("pass")),
+            "openalex_offline_replay": bool(openalex_offline.get("pass")),
         },
     }
 
@@ -2789,6 +2845,7 @@ def main():
         and scorer_det.get("pass")
         and evidence_gate.get("pass")
         and secrets_scan.get("pass")
+        and openalex_offline.get("pass")
         and (minireal.get("stats", {}).get("avg_precision", 0.0) >= 0.05)
     )
     sys.exit(0 if all_ok else 1)

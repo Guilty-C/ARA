@@ -835,6 +835,17 @@ class OpenAlexProvider(PaperProvider):
                             wait_seconds = float(2 ** retry_idx)
                     else:
                         wait_seconds = float(2 ** retry_idx)
+                    print(
+                        f"OPENALEX_RETRY status=429 attempt={attempt_count}/{max_retries + 1} sleep={wait_seconds}s"
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
+                if resp.status_code >= 500 and retry_idx < max_retries:
+                    wait_seconds = float(2 ** retry_idx)
+                    print(
+                        f"OPENALEX_RETRY status={resp.status_code} attempt={attempt_count}/{max_retries + 1} sleep={wait_seconds}s"
+                    )
                     time.sleep(wait_seconds)
                     continue
 
@@ -881,6 +892,58 @@ class OpenAlexProvider(PaperProvider):
 
         call_payload = {"query": query, "per_page": effective_per_page}
         return self.reliability.call("search_works", call_payload, _call)
+
+    def _to_work_record(self, work: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(work, dict):
+            work = {}
+        work_id = str(work.get("id", "") or "")
+        title = str(work.get("display_name", "") or "").strip()
+        year = work.get("publication_year")
+        publication_year = int(year) if isinstance(year, int) else None
+        cited_by_count = work.get("cited_by_count")
+        cited = int(cited_by_count) if isinstance(cited_by_count, int) else 0
+        doi = self._extract_doi(work)
+        authorships = work.get("authorships", [])
+        authors: List[str] = []
+        if isinstance(authorships, list):
+            for row in authorships:
+                if not isinstance(row, dict):
+                    continue
+                author = row.get("author", {})
+                if not isinstance(author, dict):
+                    continue
+                name = str(author.get("display_name", "") or "").strip()
+                if name:
+                    authors.append(name)
+        authors = sorted(set(authors), key=lambda x: x.lower())
+        return {
+            "id": work_id,
+            "title": title,
+            "publication_year": publication_year,
+            "doi": doi,
+            "cited_by_count": cited,
+            "authors": authors,
+        }
+
+    def map_search_results(self, artifact: Dict[str, Any]) -> List[Dict[str, Any]]:
+        response = artifact.get("response", {}) if isinstance(artifact, dict) else {}
+        results = response.get("results", []) if isinstance(response, dict) else []
+        if not isinstance(results, list):
+            return []
+        mapped = [self._to_work_record(w) for w in results if isinstance(w, dict)]
+        mapped = [r for r in mapped if r.get("id")]
+        mapped = sorted(
+            mapped,
+            key=lambda r: (
+                -int(r.get("cited_by_count", 0)),
+                str(r.get("id", "")),
+            ),
+        )
+        return mapped
+
+    def search_works(self, query: str, per_page: Optional[int] = None) -> List[Dict[str, Any]]:
+        artifact = self.fetch_metadata(query, per_page=per_page)
+        return self.map_search_results(artifact)
 
     def fetch_pdf(self, source: PaperSource) -> Dict[str, Any]:
         if source.source_type == "url":
