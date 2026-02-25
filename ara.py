@@ -1,9 +1,14 @@
 import argparse
+import hashlib
 import getpass
 import json
 import os
+import secrets
 import subprocess
 import sys
+import zipfile
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from urllib import request, error
 
@@ -29,9 +34,23 @@ def _resolve_run_id(output_dir: Path) -> str:
     return "unknown"
 
 
+def _make_run_id() -> str:
+    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+
+
+def _resolve_run_output_dir(args: argparse.Namespace) -> tuple[Path, str | None]:
+    if args.output_root:
+        run_id = _make_run_id()
+        run_dir = Path(args.output_root) / "runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir, run_id
+    return Path(args.output_dir), None
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     env = os.environ.copy()
-    env["OUTPUT_DIR"] = args.output_dir
+    run_dir, generated_run_id = _resolve_run_output_dir(args)
+    env["OUTPUT_DIR"] = str(run_dir)
 
     if args.initial_state_json and args.config:
         print("error: use either --config or --initial-state-json", file=sys.stderr)
@@ -68,7 +87,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(proc.stderr.strip(), file=sys.stderr)
         return proc.returncode
 
-    run_id = _resolve_run_id(Path(args.output_dir))
+    if generated_run_id:
+        print(f"RUN_ID={generated_run_id}")
+        print(f"RUN_DIR={run_dir}")
+        return 0
+
+    run_id = _resolve_run_id(run_dir)
     print(f"RUN_ID={run_id}")
     return 0
 
@@ -82,11 +106,98 @@ def _load_json(path: Path):
         return None
 
 
+def _resolve_report_dir(path_arg: str) -> tuple[Path, str | None]:
+    base = Path(path_arg)
+    runs_dir = base / "runs"
+    if runs_dir.exists() and runs_dir.is_dir():
+        run_dirs = sorted([p for p in runs_dir.iterdir() if p.is_dir()], key=lambda p: p.name)
+        if run_dirs:
+            latest = run_dirs[-1]
+            return latest, latest.name
+    return base, None
+
+
+def _scan_provider_artifacts(run_dir: Path) -> dict:
+    providers_dir = run_dir / "providers"
+    if not providers_dir.exists():
+        return {
+            "calls_total": 0,
+            "success_count": 0,
+            "fail_count": 0,
+            "pdf_count": 0,
+            "pdf_bytes": 0,
+            "retries_total": 0,
+            "stop_reason_top": "none",
+        }
+
+    artifacts = [p for p in providers_dir.rglob("*.json") if p.is_file()]
+    total = len(artifacts)
+    fail = 0
+    pdf_count = 0
+    pdf_bytes = 0
+    retries_total = 0
+    stop_reasons: Counter[str] = Counter()
+    for artifact in artifacts:
+        is_error = artifact.name.endswith("_error.json")
+        if is_error:
+            fail += 1
+
+        if ("fetch_pdf" in artifact.name) and not is_error:
+            pdf_count += 1
+
+        payload = _load_json(artifact)
+        reason = "none"
+        if isinstance(payload, dict):
+            meta = payload.get("meta")
+            if isinstance(meta, dict):
+                value = meta.get("stop_reason")
+                if isinstance(value, str) and value.strip():
+                    reason = value.strip()
+                attempts = meta.get("attempt_count")
+                if isinstance(attempts, int) and attempts > 1:
+                    retries_total += attempts - 1
+
+                attempt_rows = meta.get("attempts")
+                if isinstance(attempt_rows, list) and attempts is None:
+                    retries_total += max(len(attempt_rows) - 1, 0)
+
+                bytes_candidates = [
+                    meta.get("bytes_downloaded"),
+                    meta.get("bytes"),
+                ]
+                response = payload.get("response")
+                if isinstance(response, dict):
+                    bytes_candidates.extend([response.get("size"), response.get("bytes")])
+                for bv in bytes_candidates:
+                    if isinstance(bv, int) and bv > 0:
+                        pdf_bytes += bv
+                        break
+        stop_reasons[reason] += 1
+
+    success = total - fail
+    top = stop_reasons.most_common(5)
+    top_text = ",".join([f"{k}:{v}" for k, v in top]) if top else "none"
+    return {
+        "calls_total": total,
+        "success_count": success,
+        "fail_count": fail,
+        "pdf_count": pdf_count,
+        "pdf_bytes": pdf_bytes,
+        "retries_total": retries_total,
+        "stop_reason_top": top_text,
+    }
+
+
 def cmd_report(args: argparse.Namespace) -> int:
-    out_dir = Path(args.output_dir)
+    out_dir, run_id = _resolve_report_dir(args.output_dir)
+    if run_id:
+        print(f"run_dir={out_dir}")
+        print(f"run_id={run_id}")
+
     state = _load_json(out_dir / "state.json")
     critic = _load_json(out_dir / "critic_report.json")
     evidence = _load_json(out_dir / "evidence_table.json")
+    manifest = _load_json(out_dir / "paper_manifest.json")
 
     stages = []
     events_path = out_dir / "logs" / "events.jsonl"
@@ -125,6 +236,38 @@ def cmd_report(args: argparse.Namespace) -> int:
         print("experiment_accuracy_mean=unknown")
     else:
         print(f"experiment_accuracy_mean={accuracy_mean}")
+
+    provider = _scan_provider_artifacts(out_dir)
+    print(f"provider_artifacts_total={provider['calls_total']}")
+    print(f"provider_success={provider['success_count']}")
+    print(f"provider_fail={provider['fail_count']}")
+    print(f"provider_stop_reason_top={provider['stop_reason_top']}")
+    print(f"budget_calls_total={provider['calls_total']}")
+    print(f"budget_pdf_count={provider['pdf_count']}")
+    print(f"budget_pdf_bytes={provider['pdf_bytes']}")
+    print(f"budget_fail_count={provider['fail_count']}")
+    print(f"budget_retries_total={provider['retries_total']}")
+
+    lit_stats = None
+    cluster_stats = None
+    if isinstance(manifest, dict):
+        meta = manifest.get("meta")
+        if isinstance(meta, dict):
+            lit_stats = meta.get("literature_stats")
+            cluster_stats = meta.get("clusters_summary")
+
+    if lit_stats is None and isinstance(evidence, list) and evidence:
+        first_row = evidence[0] if isinstance(evidence[0], dict) else {}
+        lit_stats = first_row.get("literature_stats")
+        cluster_stats = first_row.get("clusters_summary")
+
+    if isinstance(lit_stats, dict):
+        print(f"works_raw_count={lit_stats.get('works_raw_count', 'unknown')}")
+        print(f"works_dedup_count={lit_stats.get('works_dedup_count', 'unknown')}")
+        print(f"dedup_removed={lit_stats.get('dedup_removed', 'unknown')}")
+    if isinstance(cluster_stats, dict):
+        print(f"cluster_count={cluster_stats.get('cluster_count', 'unknown')}")
+        print(f"largest_cluster_size={cluster_stats.get('largest_cluster_size', 'unknown')}")
 
     for name in ["paper.md", "paper_manifest.json", "evidence_table.json", "critic_report.json"]:
         p = out_dir / name
@@ -467,12 +610,81 @@ def cmd_set_openalex_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_probable_run_dir(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    if (path / "state.json").exists():
+        return True
+    if path.parent.name == "runs":
+        return True
+    expected = [
+        "paper.md",
+        "paper_manifest.json",
+        "evidence_table.json",
+        "critic_report.json",
+        "logs",
+        "providers",
+    ]
+    return any((path / name).exists() for name in expected)
+
+
+def cmd_bundle(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir)
+    if not _is_probable_run_dir(run_dir):
+        print(
+            f"error: --run-dir must point to a run directory (got: {run_dir})",
+            file=sys.stderr,
+        )
+        return 2
+
+    out_path = Path(args.out) if args.out else run_dir.parent / f"{run_dir.name}_bundle.zip"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    include_files: list[Path] = []
+    fixed = ["paper.md", "paper_manifest.json", "evidence_table.json", "critic_report.json", "state.json"]
+    for name in fixed:
+        p = run_dir / name
+        if p.exists() and p.is_file():
+            include_files.append(p)
+    for name in ["logs", "providers"]:
+        base = run_dir / name
+        if base.exists() and base.is_dir():
+            include_files.extend([p for p in base.rglob("*") if p.is_file()])
+
+    if not include_files:
+        print(f"error: no bundleable artifacts found under run dir: {run_dir}", file=sys.stderr)
+        return 2
+
+    index_lines = []
+    for p in sorted(include_files, key=lambda x: str(x.relative_to(run_dir))):
+        rel = p.relative_to(run_dir).as_posix()
+        index_lines.append(f"{_sha256_file(p)}  {rel}")
+
+    with zipfile.ZipFile(out_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in include_files:
+            zf.write(p, arcname=p.relative_to(run_dir).as_posix())
+        zf.writestr("INDEX.txt", "\n".join(index_lines) + "\n")
+
+    print(f"BUNDLE_OUT={out_path}")
+    print(f"BUNDLE_INDEX_LINES={len(index_lines)}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ara")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run")
-    p_run.add_argument("--output-dir", required=True)
+    p_run.add_argument("--output-dir", default="outputs")
+    p_run.add_argument("--output-root")
     p_run.add_argument("--config")
     p_run.add_argument("--initial-state-json")
     p_run.set_defaults(func=cmd_run)
@@ -508,6 +720,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_set_key.add_argument("--key-file", default="data/secrets/openalex_api_key.txt")
     p_set_key.add_argument("--key")
     p_set_key.set_defaults(func=cmd_set_openalex_key)
+
+    p_bundle = sub.add_parser("bundle")
+    p_bundle.add_argument("--run-dir", required=True)
+    p_bundle.add_argument("--out")
+    p_bundle.set_defaults(func=cmd_bundle)
     return parser
 
 
