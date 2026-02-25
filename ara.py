@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib import request, error
 
-from sr_pipeline.providers import OpenAlexProvider, UnpaywallProvider
+from sr_pipeline.providers import OpenAlexProvider, UnpaywallProvider, PaperSource
 
 
 def _resolve_run_id(output_dir: Path) -> str:
@@ -1029,6 +1029,143 @@ def cmd_net_smoke(args: argparse.Namespace) -> int:
     has_fail = any(x.get("verdict") == "FAIL" for x in [result["openalex"], result["unpaywall"]])
     return 1 if has_fail else 0
 
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _json_sha256(payload: dict) -> str:
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _capture_fixture(path: Path, payload: dict, overwrite: bool) -> dict:
+    digest = _json_sha256(payload)
+    info = {"path": str(path), "sha256": digest, "status": "written"}
+    if path.exists() and not overwrite:
+        info["status"] = "exists"
+        return info
+    _write_json_atomic(path, payload)
+    if path.exists() and overwrite:
+        info["status"] = "replaced"
+    return info
+
+
+def cmd_capture_replay(args: argparse.Namespace) -> int:
+    mode = (args.mode or "LIVE").upper()
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    overwrite = bool(int(args.overwrite))
+    download_pdf = bool(int(args.download_pdf))
+
+    os.environ["PROVIDER_MODE"] = mode
+    os.environ["OUTPUT_DIR"] = str(out_dir)
+    os.environ.setdefault("PROVIDER_ARTIFACT_DEBUG", "1")
+
+    stop_reasons: list[str] = []
+    openalex_key = OpenAlexProvider._read_secret_key()
+    unpaywall_email = os.environ.get("UNPAYWALL_EMAIL", "").strip()
+    if mode == "LIVE":
+        if not openalex_key:
+            stop_reasons.append("missing_openalex_api_key")
+        if not unpaywall_email:
+            stop_reasons.append("missing_unpaywall_email")
+
+    manifest = {
+        "mode": mode,
+        "query": args.query,
+        "doi": args.doi,
+        "n_works": int(args.n_works),
+        "overwrite": overwrite,
+        "download_pdf": download_pdf,
+        "providers": {
+            "openalex": "OpenAlexProvider",
+            "unpaywall": "UnpaywallProvider",
+        },
+        "fixtures": [],
+        "stop_reasons": stop_reasons,
+    }
+
+    if stop_reasons:
+        manifest["status"] = "SKIP"
+        manifest_path = out_dir / "capture_manifest.json"
+        _write_json_atomic(manifest_path, manifest)
+        print(f"CAPTURE_REPLAY_RESULT={json.dumps(manifest, ensure_ascii=False)}")
+        print(f"CAPTURE_MANIFEST={manifest_path}")
+        return 0
+
+    fixtures_root = Path("fixtures")
+    openalex_dir = fixtures_root / "openalex"
+    unpaywall_dir = fixtures_root / "unpaywall"
+    manifests_dir = fixtures_root / "manifests"
+    for d in [openalex_dir, unpaywall_dir, manifests_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    resolved_doi = (args.doi or "").strip() or None
+
+    try:
+        openalex = OpenAlexProvider()
+        per_page = max(1, min(int(args.n_works), 10))
+        oa_artifact = openalex.fetch_metadata(args.query, per_page=per_page)
+        manifest["fixtures"].append(
+            _capture_fixture(openalex_dir / "search_works.json", oa_artifact, overwrite)
+        )
+        if not resolved_doi:
+            mapped = openalex.map_search_results(oa_artifact)
+            for row in mapped:
+                doi = row.get("doi")
+                if isinstance(doi, str) and doi.strip():
+                    resolved_doi = doi.strip()
+                    break
+    except Exception as exc:
+        reason = "openalex_capture_failed"
+        if hasattr(exc, "meta") and isinstance(getattr(exc, "meta"), dict):
+            reason = str(getattr(exc, "meta").get("stop_reason", reason))
+        manifest["stop_reasons"].append(reason)
+
+    if resolved_doi:
+        manifest["doi"] = resolved_doi
+        try:
+            up = UnpaywallProvider()
+            up_artifact = up.fetch_metadata(resolved_doi)
+            manifest["fixtures"].append(
+                _capture_fixture(unpaywall_dir / "lookup.json", up_artifact, overwrite)
+            )
+            if download_pdf:
+                urls = _extract_unpaywall_urls(
+                    up_artifact.get("response", {}) if isinstance(up_artifact, dict) else {}
+                )
+                if urls:
+                    try:
+                        pdf_res = openalex.fetch_pdf(PaperSource(source_type="url", path_or_url=urls[0]))
+                        manifest["fixtures"].append(
+                            _capture_fixture(openalex_dir / "fetch_pdf.json", pdf_res, overwrite)
+                        )
+                    except Exception as exc:
+                        reason = "pdf_capture_failed"
+                        if hasattr(exc, "meta") and isinstance(getattr(exc, "meta"), dict):
+                            reason = str(getattr(exc, "meta").get("stop_reason", reason))
+                        manifest["stop_reasons"].append(reason)
+        except Exception as exc:
+            reason = "unpaywall_capture_failed"
+            if hasattr(exc, "meta") and isinstance(getattr(exc, "meta"), dict):
+                reason = str(getattr(exc, "meta").get("stop_reason", reason))
+            manifest["stop_reasons"].append(reason)
+    else:
+        manifest["stop_reasons"].append("missing_doi_for_unpaywall_capture")
+
+    manifest["status"] = "OK" if not manifest["stop_reasons"] else "PARTIAL"
+    manifest_path = out_dir / "capture_manifest.json"
+    _write_json_atomic(manifest_path, manifest)
+    manifest_copy = manifests_dir / f"capture_{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    _write_json_atomic(manifest_copy, manifest)
+    print(f"CAPTURE_REPLAY_RESULT={json.dumps(manifest, ensure_ascii=False)}")
+    print(f"CAPTURE_MANIFEST={manifest_path}")
+    return 0
+
 def cmd_set_openalex_key(args: argparse.Namespace) -> int:
     key_file = Path(args.key_file)
     key_value = args.key
@@ -1188,6 +1325,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_net_smoke.add_argument("--query", default="industrial anomaly detection")
     p_net_smoke.add_argument("--doi", default="10.1038/s41586-020-2649-2")
     p_net_smoke.set_defaults(func=cmd_net_smoke)
+
+    p_capture = sub.add_parser("capture-replay")
+    p_capture.add_argument("--mode", choices=["REPLAY", "LIVE"], default="LIVE")
+    p_capture.add_argument("--output-dir", default="outputs_capture_replay")
+    p_capture.add_argument("--query", default="industrial anomaly detection")
+    p_capture.add_argument("--doi")
+    p_capture.add_argument("--n-works", type=int, default=5)
+    p_capture.add_argument("--overwrite", type=int, choices=[0, 1], default=0)
+    p_capture.add_argument("--download-pdf", type=int, choices=[0, 1], default=0)
+    p_capture.set_defaults(func=cmd_capture_replay)
 
     p_set_key = sub.add_parser("set-openalex-key")
     p_set_key.add_argument("--key-file", default="data/secrets/openalex_api_key.txt")

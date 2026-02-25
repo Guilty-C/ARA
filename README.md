@@ -54,6 +54,10 @@ python -m ara report outputs_e2e/live_run
 - Manual live smoke (not for CI):
   - `python -m ara live-smoke --mode LIVE --query "machine learning" --min-works 3 --output-dir outputs_e2e/openalex_live_smoke`
   - On success it prints top 3 `(id, title, year)` rows.
+- Optional fixture capture (local only, not CI):
+  - `python -m ara capture-replay --mode LIVE --output-dir outputs_capture/openalex --query "industrial anomaly detection" --n-works 5 --overwrite 0`
+  - Fixtures are stored under `fixtures/openalex`, `fixtures/unpaywall`, and capture manifests under `fixtures/manifests`.
+  - Safety: default `--overwrite 0` never replaces existing fixture files.
 
 ### PowerShell
 ```powershell

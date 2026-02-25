@@ -282,16 +282,36 @@ class ProviderReliabilityLayer(ReliabilityLayer):
         })
 
     def _handle_replay(self, method_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        mock_ts_raw = os.environ.get("MOCK_TIMESTAMP", "").strip()
+        try:
+            replay_ts = float(mock_ts_raw) if mock_ts_raw else 0.0
+        except ValueError:
+            replay_ts = 0.0
         method_stub = method_name.split("_")[0] if "_" in method_name else method_name
+        nested_candidates = [
+            Path("fixtures") / self.provider_name / f"{method_name}.json",
+            Path("fixtures") / self.provider_name / f"{method_stub}.json",
+        ]
         candidates = [
             self.fixtures_dir / f"provider_{self.provider_name}_{method_name}.json",
             self.fixtures_dir / f"provider_{self.provider_name}_{method_stub}.json",
+            Path("fixtures") / f"provider_{self.provider_name}_{method_name}.json",
+            Path("fixtures") / f"provider_{self.provider_name}_{method_stub}.json",
+            *nested_candidates,
         ]
         fixture_path: Optional[Path] = next((p for p in candidates if p.exists()), None)
         if fixture_path is None:
-            fallback = sorted(self.fixtures_dir.glob(f"provider_{self.provider_name}_*.json"))
-            if fallback:
-                fixture_path = fallback[0]
+            fallback_roots = [self.fixtures_dir, Path("fixtures"), Path("fixtures") / self.provider_name]
+            for root in fallback_roots:
+                if not root.exists():
+                    continue
+                if root.name == self.provider_name:
+                    fallback = sorted(root.glob("*.json"))
+                else:
+                    fallback = sorted(root.glob(f"provider_{self.provider_name}_*.json"))
+                if fallback:
+                    fixture_path = fallback[0]
+                    break
         if fixture_path is None:
             raise FileNotFoundError(f"No fixtures found for {self.provider_name}:{method_name} in REPLAY mode")
 
@@ -307,7 +327,7 @@ class ProviderReliabilityLayer(ReliabilityLayer):
             artifact["method"] = method_name
             artifact["payload"] = payload
             artifact["sha256"] = self._canonical_sha256(artifact.get("response", {}), merged_meta)
-            artifact["timestamp"] = time.time()
+            artifact["timestamp"] = replay_ts
             return artifact
 
         replay_meta = {
@@ -315,7 +335,10 @@ class ProviderReliabilityLayer(ReliabilityLayer):
             "replay_mode": True,
             "status": "replay",
         }
-        return self._build_artifact(method_name, payload, fixture_data, replay_meta)
+        artifact = self._build_artifact(method_name, payload, fixture_data, replay_meta)
+        artifact["timestamp"] = replay_ts
+        artifact["sha256"] = self._canonical_sha256(artifact.get("response", {}), replay_meta)
+        return artifact
 
 
 class PaperProvider:

@@ -2694,6 +2694,139 @@ def run_secrets_leak_scan_test():
     }
 
 
+def run_fixtures_secrets_scan_test():
+    print("--- Running Fixtures Secrets Scan Test ---")
+    patterns = [
+        re.compile(r"openalex_api_key", re.IGNORECASE),
+        re.compile(r"unpaywall_email", re.IGNORECASE),
+        re.compile(r"api[_-]?key\\s*[:=]"),
+        re.compile(r"authorization\\s*[:=]", re.IGNORECASE),
+        re.compile(r"bearer\\s+[a-z0-9._\\-]+", re.IGNORECASE),
+        re.compile(r"mailto\\s*=", re.IGNORECASE),
+    ]
+    roots = [Path("fixtures"), Path("data/fixtures")]
+    hits = []
+    scanned_files = 0
+
+    def _scan_text(text: str, path_label: str):
+        for pat in patterns:
+            if pat.search(text):
+                hits.append({"path": path_label, "pattern": pat.pattern})
+                break
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            scanned_files += 1
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+            _scan_text(txt, p.as_posix())
+
+    out_root = Path("outputs_test")
+    if out_root.exists():
+        for z in out_root.rglob("*_bundle.zip"):
+            scanned_files += 1
+            try:
+                with zipfile.ZipFile(z, "r") as zf:
+                    if "INDEX.txt" in zf.namelist():
+                        idx_text = zf.read("INDEX.txt").decode("utf-8", errors="ignore")
+                        _scan_text(idx_text, f"{z.as_posix()}::INDEX.txt")
+            except Exception:
+                hits.append({"path": z.as_posix(), "pattern": "zip_read_failed"})
+
+    return {
+        "pass": len(hits) == 0,
+        "hit_count": len(hits),
+        "hits": hits[:10],
+        "scanned_files": scanned_files,
+    }
+
+
+def run_fixture_replay_determinism_test():
+    print("--- Running Fixture Replay Determinism Test ---")
+    out_a = Path("outputs_test/fixture_replay_det_a")
+    out_b = Path("outputs_test/fixture_replay_det_b")
+    for d in [out_a, out_b]:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+
+    cfg_path = Path("outputs_test/fixture_replay_det_config.json")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        json.dumps({"topic": "industrial anomaly detection", "constraints": {"compute": "low"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    server_env = os.environ.copy()
+    server_env["PORT"] = "8106"
+    server_process = subprocess.Popen(
+        [sys.executable, "tools_server/dummy_tool_server.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=server_env,
+    )
+    if not wait_for_port("127.0.0.1", 8106):
+        return {"pass": False, "error": "server_start_failed"}
+
+    try:
+        env = os.environ.copy()
+        env["TOOL_API_BASE"] = "http://127.0.0.1:8106"
+        env["API_BASE_URL"] = "http://127.0.0.1:8106/api"
+        env["PROVIDER_MODE"] = "REPLAY"
+        env["MOCK_TIMESTAMP"] = "1234567890"
+
+        run1 = subprocess.run(
+            [sys.executable, "-m", "ara", "run", "--output-dir", str(out_a), "--config", str(cfg_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        run2 = subprocess.run(
+            [sys.executable, "-m", "ara", "run", "--output-dir", str(out_b), "--config", str(cfg_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        server_process.terminate()
+        server_process.wait()
+
+    h_paper_a = _sha256(out_a / "paper.md")
+    h_paper_b = _sha256(out_b / "paper.md")
+    h_manifest_a = _sha256(out_a / "paper_manifest.json")
+    h_manifest_b = _sha256(out_b / "paper_manifest.json")
+    providers_a = out_a / "providers"
+    providers_b = out_b / "providers"
+    prov_index_a = {}
+    prov_index_b = {}
+    if providers_a.exists():
+        for p in sorted(providers_a.rglob("*.json")):
+            rel = p.relative_to(providers_a).as_posix()
+            prov_index_a[rel] = _sha256(p)
+    if providers_b.exists():
+        for p in sorted(providers_b.rglob("*.json")):
+            rel = p.relative_to(providers_b).as_posix()
+            prov_index_b[rel] = _sha256(p)
+    provider_artifacts_match = prov_index_a == prov_index_b
+    return {
+        "pass": (
+            run1.returncode == 0
+            and run2.returncode == 0
+            and h_paper_a == h_paper_b
+            and h_manifest_a == h_manifest_b
+            and provider_artifacts_match
+        ),
+        "paper_sha_a": h_paper_a,
+        "paper_sha_b": h_paper_b,
+        "manifest_sha_a": h_manifest_a,
+        "manifest_sha_b": h_manifest_b,
+        "provider_artifacts_match": provider_artifacts_match,
+    }
+
+
 def run_openalex_offline_replay_test():
     print("--- Running OpenAlex Offline Replay Test ---")
     import sr_pipeline.providers as providers_mod
@@ -2759,6 +2892,8 @@ def main():
     evidence_gate = run_evidence_gate_test()
     secrets_scan = run_secrets_leak_scan_test()
     openalex_offline = run_openalex_offline_replay_test()
+    fixtures_secrets = run_fixtures_secrets_scan_test()
+    fixture_replay_det = run_fixture_replay_determinism_test()
 
     score = 10
     if not minireal.get("pass"):
@@ -2786,6 +2921,10 @@ def main():
     if not secrets_scan.get("pass"):
         score -= 2
     if not openalex_offline.get("pass"):
+        score -= 2
+    if not fixtures_secrets.get("pass"):
+        score -= 2
+    if not fixture_replay_det.get("pass"):
         score -= 2
     if score < 0:
         score = 0
@@ -2829,6 +2968,10 @@ def main():
             "secrets_leak_scan": bool(secrets_scan.get("pass")),
             "openalex_offline_replay": bool(openalex_offline.get("pass")),
         },
+        "milestone12": {
+            "fixtures_secrets_scan": bool(fixtures_secrets.get("pass")),
+            "fixture_replay_determinism": bool(fixture_replay_det.get("pass")),
+        },
     }
 
     print(f"ACCEPTANCE_JSON={json.dumps(acceptance, sort_keys=True)}")
@@ -2846,6 +2989,8 @@ def main():
         and evidence_gate.get("pass")
         and secrets_scan.get("pass")
         and openalex_offline.get("pass")
+        and fixtures_secrets.get("pass")
+        and fixture_replay_det.get("pass")
         and (minireal.get("stats", {}).get("avg_precision", 0.0) >= 0.05)
     )
     sys.exit(0 if all_ok else 1)
