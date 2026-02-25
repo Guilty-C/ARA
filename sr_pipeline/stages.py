@@ -1,5 +1,11 @@
 from __future__ import annotations
 from typing import Protocol, Optional
+from collections import Counter, defaultdict
+from pathlib import Path
+import hashlib
+import json
+import os
+import re
 from sr_pipeline.state import ResearchState
 from sr_pipeline.tools import ToolRegistry
 from sr_pipeline.api_port import APIClient
@@ -8,6 +14,211 @@ class Stage(Protocol):
     name: str
     def can_run(self, st: ResearchState) -> bool: ...
     def run(self, st: ResearchState, tools: ToolRegistry, api: Optional[APIClient] = None) -> ResearchState: ...
+
+
+def _collapse_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _normalize_doi(doi_value: str | None) -> str | None:
+    if not doi_value:
+        return None
+    value = str(doi_value).strip().lower()
+    value = re.sub(r"^https?://(dx\.)?doi\.org/", "", value, flags=re.IGNORECASE)
+    return value or None
+
+
+def _extract_display_authors(metadata: dict) -> list[str]:
+    authors = []
+    raw = metadata.get("authorships", [])
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            author = item.get("author", {})
+            if not isinstance(author, dict):
+                continue
+            name = _collapse_spaces(str(author.get("display_name", "")))
+            if name:
+                authors.append(name)
+    unique = sorted(set(authors), key=lambda s: s.lower())
+    return unique
+
+
+def _extract_venue(metadata: dict) -> str | None:
+    host = metadata.get("host_venue")
+    if isinstance(host, dict):
+        name = _collapse_spaces(str(host.get("display_name", "")))
+        if name:
+            return name
+    return None
+
+
+def _extract_year(metadata: dict) -> int | None:
+    year = metadata.get("publication_year")
+    if isinstance(year, int):
+        return year
+    if isinstance(year, str) and year.isdigit():
+        return int(year)
+    return None
+
+
+def _extract_urls(metadata: dict, source: str) -> list[str]:
+    urls = []
+    if source:
+        urls.append(source.strip())
+    oa = metadata.get("open_access", {})
+    if isinstance(oa, dict):
+        oa_url = oa.get("oa_url")
+        if isinstance(oa_url, str) and oa_url.strip():
+            urls.append(oa_url.strip())
+    unique = sorted(set([u for u in urls if u]), key=lambda s: s.lower())
+    return unique
+
+
+def normalize_work(work_dict: dict) -> dict:
+    source = str(work_dict.get("source", "") or "").strip()
+    metadata = work_dict.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    doi = _normalize_doi(metadata.get("doi") or metadata.get("ids", {}).get("doi"))
+    title = _collapse_spaces(str(metadata.get("display_name", "") or Path(source).stem or "untitled"))
+    title_normalized = title.lower()
+    year = _extract_year(metadata)
+    authors = _extract_display_authors(metadata)
+    venue = _extract_venue(metadata)
+    urls = _extract_urls(metadata, source)
+
+    provenance_in = metadata.get("provenance", {})
+    if not isinstance(provenance_in, dict):
+        provenance_in = {}
+    provenance = {
+        "doi": provenance_in.get("doi", "openalex" if doi else "local"),
+        "title": provenance_in.get("title", "openalex" if metadata else "local"),
+        "year": provenance_in.get("year", "openalex" if year is not None else "local"),
+        "authors": provenance_in.get("authors", "openalex" if authors else "local"),
+        "venue": provenance_in.get("venue", "openalex" if venue else "local"),
+        "urls": provenance_in.get("urls", "openalex" if metadata else "local"),
+    }
+
+    cluster_key = doi if doi else title_normalized
+    cluster_id = hashlib.sha256(cluster_key.encode("utf-8")).hexdigest()[:12] if cluster_key else ""
+    return {
+        "doi": doi,
+        "title": title,
+        "year": year,
+        "authors": authors,
+        "venue": venue,
+        "urls": urls,
+        "provenance": provenance,
+        "cluster_key": cluster_key,
+        "cluster_id": cluster_id,
+    }
+
+
+def _dedup_work_records(raw_records: list[dict]) -> tuple[list[dict], dict, dict]:
+    sorted_records = sorted(
+        raw_records,
+        key=lambda r: (
+            str(r.get("cluster_key", "")),
+            str(r.get("doi") or ""),
+            str(r.get("title") or "").lower(),
+            ",".join(r.get("urls", [])),
+        ),
+    )
+
+    dedup_map: dict[str, dict] = {}
+    clusters = defaultdict(list)
+    for record in sorted_records:
+        key = str(record.get("cluster_key", ""))
+        if not key:
+            continue
+        clusters[key].append(record)
+        if key in dedup_map:
+            continue
+        dedup_map[key] = record
+
+    deduped = [dedup_map[k] for k in sorted(dedup_map.keys())]
+    raw_count = len(sorted_records)
+    dedup_count = len(deduped)
+    stats = {
+        "works_raw_count": raw_count,
+        "works_dedup_count": dedup_count,
+        "dedup_removed": raw_count - dedup_count,
+    }
+    cluster_sizes = [len(v) for v in clusters.values()]
+    clusters_summary = {
+        "cluster_count": len(clusters),
+        "largest_cluster_size": max(cluster_sizes) if cluster_sizes else 0,
+    }
+    return deduped, stats, clusters_summary
+
+
+def _scan_provider_budgets(output_dir: Path) -> dict:
+    providers_dir = output_dir / "providers"
+    if not providers_dir.exists():
+        return {
+            "calls_total": 0,
+            "pdf_count": 0,
+            "pdf_bytes": 0,
+            "fail_count": 0,
+            "retries_total": 0,
+            "stop_reason_top": [],
+        }
+
+    artifact_paths = sorted([p for p in providers_dir.rglob("*.json") if p.is_file()], key=lambda p: str(p))
+    calls_total = len(artifact_paths)
+    pdf_count = 0
+    pdf_bytes = 0
+    fail_count = 0
+    retries_total = 0
+    stop_counter: Counter[str] = Counter()
+
+    for artifact_path in artifact_paths:
+        is_error = artifact_path.name.endswith("_error.json")
+        if is_error:
+            fail_count += 1
+
+        if ("fetch_pdf" in artifact_path.name) and (not is_error):
+            pdf_count += 1
+
+        try:
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except Exception:
+            artifact = {}
+
+        meta = artifact.get("meta", {}) if isinstance(artifact, dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+
+        stop_reason = str(meta.get("stop_reason", "none") or "none")
+        stop_counter[stop_reason] += 1
+
+        attempt_count = meta.get("attempt_count")
+        if isinstance(attempt_count, int):
+            retries_total += max(0, attempt_count - 1)
+        else:
+            attempts = meta.get("attempts")
+            if isinstance(attempts, list):
+                retries_total += max(0, len(attempts) - 1)
+
+        response = artifact.get("response", {}) if isinstance(artifact, dict) else {}
+        if not isinstance(response, dict):
+            response = {}
+        for candidate in [meta.get("bytes_downloaded"), meta.get("bytes"), response.get("size"), response.get("bytes")]:
+            if isinstance(candidate, int) and candidate > 0:
+                pdf_bytes += candidate
+                break
+
+    return {
+        "calls_total": calls_total,
+        "pdf_count": pdf_count,
+        "pdf_bytes": pdf_bytes,
+        "fail_count": fail_count,
+        "retries_total": retries_total,
+        "stop_reason_top": stop_counter.most_common(5),
+    }
 
 class TopicStage:
     name = "topic"
@@ -170,27 +381,25 @@ class LiteratureStage:
         # Level-2: RAG-first literature review
         from sr_pipeline.literature.agent import LiteratureReviewAgent
         from sr_pipeline.providers import get_provider
-        from pathlib import Path
-        import json
-        import os
         
-        # Determine sources - Update to support multiple PDFs + URLs
-        sources = []
+        raw_items = []
         for p in Path(".").glob("*.pdf"):
-            sources.append(str(p))
-            
+            raw_items.append({"source": str(p), "metadata": {}})
+
         # Inject sources via env (for testing providers)
         env_sources = os.environ.get("PAPER_SOURCES")
         if env_sources:
             try:
                 s = json.loads(env_sources)
                 if isinstance(s, list):
-                    sources.extend(s)
+                    for item in s:
+                        raw_items.append({"source": str(item), "metadata": {}})
             except:
                 if "," in env_sources:
-                    sources.extend(env_sources.split(","))
+                    for item in env_sources.split(","):
+                        raw_items.append({"source": item.strip(), "metadata": {}})
                 else:
-                    sources.append(env_sources)
+                    raw_items.append({"source": env_sources, "metadata": {}})
 
         # Provider-driven discovery (OpenAlex + optional Unpaywall DOI OA lookup)
         if st.topic:
@@ -199,19 +408,26 @@ class LiteratureStage:
                 provider_sources = provider.resolve_paper_sources({"topics": [st.topic]})
                 for ps in provider_sources:
                     if getattr(ps, "source_type", "") == "url" and getattr(ps, "path_or_url", ""):
-                        sources.append(ps.path_or_url)
+                        raw_items.append(
+                            {
+                                "source": str(ps.path_or_url),
+                                "metadata": ps.metadata if isinstance(ps.metadata, dict) else {},
+                            }
+                        )
             except Exception as e:
                 print(f"LiteratureStage: provider source discovery degraded: {e}")
 
-        # Keep source order deterministic while deduplicating.
-        deduped_sources = []
-        seen_sources = set()
-        for src in sources:
-            if src in seen_sources:
-                continue
-            seen_sources.add(src)
-            deduped_sources.append(src)
-        sources = deduped_sources
+        raw_records = [normalize_work(item) for item in raw_items if item.get("source")]
+        deduped_records, literature_stats, clusters_summary = _dedup_work_records(raw_records)
+        st.work_records = deduped_records
+        st.literature_stats = literature_stats
+        st.clusters_summary = clusters_summary
+
+        sources = []
+        for rec in deduped_records:
+            urls = rec.get("urls", [])
+            if isinstance(urls, list) and urls:
+                sources.append(urls[0])
 
         agent = LiteratureReviewAgent(sources)
         results = agent.run(st.topic or "Research")
@@ -235,6 +451,10 @@ class LiteratureStage:
         if forced_rows and st.evidence_table is not None:
             keep_n = max(0, int(forced_rows))
             st.evidence_table = st.evidence_table[:keep_n]
+
+        if st.evidence_table and isinstance(st.evidence_table[0], dict):
+            st.evidence_table[0]["literature_stats"] = literature_stats
+            st.evidence_table[0]["clusters_summary"] = clusters_summary
         
         # Legacy compatibility
         bib_summary = "\n".join([f"- {item['citation_key']}: {item['takeaway']}" for item in st.annotated_bib])
@@ -589,9 +809,6 @@ class PaperStage:
     def run(self, st: ResearchState, tools: ToolRegistry, api: Optional[APIClient] = None) -> ResearchState:
         from sr_pipeline.agents.paper_and_figures import PaperAndFiguresAgent
         from sr_pipeline.agents.base import AgentContext
-        from pathlib import Path
-        import os
-        import json
         
         # 1. Run Agent
         agent = PaperAndFiguresAgent()
@@ -611,18 +828,29 @@ class PaperStage:
         
         if res["status"] == "success":
             st.paper_md = res["paper_markdown"]
-            # We should probably store manifest in state?
-            # Prompt: "paper_manifest.json (NEW OR embedded in state)"
-            # Let's verify if state has field for it? No.
-            # But we can persist it to disk.
-            
             out_dir = Path(os.environ.get("OUTPUT_DIR", "outputs"))
             out_dir.mkdir(parents=True, exist_ok=True)
-            
+            manifest = res["manifest"] if isinstance(res.get("manifest"), dict) else {}
+
+            meta = manifest.get("meta", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            if isinstance(st.literature_stats, dict):
+                meta["literature_stats"] = st.literature_stats
+            if isinstance(st.clusters_summary, dict):
+                meta["clusters_summary"] = st.clusters_summary
+            manifest["meta"] = meta
+
+            budgets = _scan_provider_budgets(out_dir)
+            st.budgets = budgets
+            manifest["budgets"] = budgets
+
             (out_dir / "paper.md").write_text(st.paper_md, encoding="utf-8")
-            (out_dir / "paper_manifest.json").write_text(json.dumps(res["manifest"], indent=2), encoding="utf-8")
+            (out_dir / "paper_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             
-            tools.summarize(f"Paper generated with {len(res['manifest']['figures'])} figures and {len(res['manifest']['citations'])} citations.")
+            tools.summarize(
+                f"Paper generated with {len(manifest.get('figures', []))} figures and {len(manifest.get('citations', []))} citations."
+            )
         else:
             tools.summarize("Paper generation failed.")
             

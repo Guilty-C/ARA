@@ -20,6 +20,9 @@ class ResearchState:
     annotated_bib: Optional[List[Dict[str, Any]]] = None
     evidence_table: Optional[List[Dict[str, Any]]] = None
     missing_matrix: Optional[List[Dict[str, Any]]] = None
+    work_records: Optional[List[Dict[str, Any]]] = None
+    literature_stats: Optional[Dict[str, Any]] = None
+    clusters_summary: Optional[Dict[str, Any]] = None
 
     # Level-3 Topic & Background Artifacts
     ranked_topics: Optional[List[Dict[str, Any]]] = None
@@ -45,6 +48,7 @@ class ResearchState:
     config_hash: Optional[str] = None
     env_snapshot: Optional[Dict[str, str]] = None
     stop_reason: Optional[str] = None # For explicit dead ends
+    budgets: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
