@@ -2170,12 +2170,194 @@ def run_cli_smoke_test():
         server_process.wait()
 
 
+def run_dedup_controlled_case_test():
+    print("--- Running Dedup Controlled Bad Case Test ---")
+    out_a = Path("outputs_test/dedup_case_a")
+    out_b = Path("outputs_test/dedup_case_b")
+    for d in [out_a, out_b]:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+
+    server_env = os.environ.copy()
+    server_env["PORT"] = "8101"
+    server_process = subprocess.Popen(
+        [sys.executable, "tools_server/dummy_tool_server.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=server_env,
+    )
+    if not wait_for_port("127.0.0.1", 8101):
+        return {"pass": False, "error": "server_start_failed"}
+
+    dup_sources = (
+        ["https://example.com/dup-a.pdf"] * 6
+        + ["https://example.com/dup-b.pdf", "https://example.com/dup-c"]
+    )
+
+    def _run_once(out_dir: Path):
+        env = os.environ.copy()
+        env["OUTPUT_DIR"] = str(out_dir)
+        env["TOOL_API_BASE"] = "http://127.0.0.1:8101"
+        env["API_BASE_URL"] = "http://127.0.0.1:8101/api"
+        env["PROVIDER_MODE"] = "REPLAY"
+        env["MOCK_TIMESTAMP"] = "1234567890"
+        env["PAPER_SOURCES"] = json.dumps(dup_sources)
+        env["INITIAL_STATE"] = json.dumps(
+            {
+                "topic": "industrial anomaly detection",
+                "constraints": {"literature": {"max_works": 50, "max_sources": 50, "max_pdfs": 50, "max_pdf_bytes": 50000000}},
+            },
+            sort_keys=True,
+        )
+        run = subprocess.run([sys.executable, "run_pipeline.py"], env=env, capture_output=True, text=True)
+        manifest_path = out_dir / "paper_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        meta = manifest.get("meta", {}) if isinstance(manifest, dict) else {}
+        stats = meta.get("literature_stats", {}) if isinstance(meta, dict) else {}
+        clusters = meta.get("clusters_summary", {}) if isinstance(meta, dict) else {}
+        return run.returncode, stats, clusters
+
+    try:
+        rc_a, stats_a, clusters_a = _run_once(out_a)
+        rc_b, stats_b, clusters_b = _run_once(out_b)
+    finally:
+        server_process.terminate()
+        server_process.wait()
+
+    raw = int(stats_a.get("works_raw_count", 0)) if isinstance(stats_a, dict) else 0
+    dedup = int(stats_a.get("works_dedup_count", 0)) if isinstance(stats_a, dict) else 0
+    removed = int(stats_a.get("dedup_removed", 0)) if isinstance(stats_a, dict) else 0
+    cluster_count = int(clusters_a.get("cluster_count", 0)) if isinstance(clusters_a, dict) else 0
+
+    pass_case = (
+        rc_a == 0
+        and rc_b == 0
+        and raw > dedup
+        and removed >= 1
+        and cluster_count <= dedup
+        and stats_a == stats_b
+        and clusters_a == clusters_b
+    )
+    return {
+        "pass": pass_case,
+        "stats_a": stats_a,
+        "stats_b": stats_b,
+        "clusters_a": clusters_a,
+        "clusters_b": clusters_b,
+    }
+
+
+def run_budget_controlled_case_test():
+    print("--- Running Budget Controlled Bad Case Test ---")
+    out_degrade = Path("outputs_test/budget_case_degrade")
+    out_failfast = Path("outputs_test/budget_case_failfast")
+    for d in [out_degrade, out_failfast]:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+
+    server_env = os.environ.copy()
+    server_env["PORT"] = "8102"
+    server_process = subprocess.Popen(
+        [sys.executable, "tools_server/dummy_tool_server.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=server_env,
+    )
+    if not wait_for_port("127.0.0.1", 8102):
+        return {"pass": False, "error": "server_start_failed"}
+
+    sources = [
+        "https://example.com/a.pdf",
+        "https://example.com/b.pdf",
+        "https://example.com/c.pdf",
+    ]
+    initial_state = json.dumps(
+        {
+            "topic": "industrial anomaly detection",
+            "constraints": {
+                "literature": {
+                    "max_pdfs": 1,
+                    "max_sources": 50,
+                    "max_works": 50,
+                    "max_pdf_bytes": 50000000,
+                }
+            },
+        },
+        sort_keys=True,
+    )
+
+    def _run_case(out_dir: Path, fail_fast_value: str):
+        env = os.environ.copy()
+        env["OUTPUT_DIR"] = str(out_dir)
+        env["TOOL_API_BASE"] = "http://127.0.0.1:8102"
+        env["API_BASE_URL"] = "http://127.0.0.1:8102/api"
+        env["PROVIDER_MODE"] = "REPLAY"
+        env["MOCK_TIMESTAMP"] = "1234567890"
+        env["FAIL_FAST"] = fail_fast_value
+        env["PAPER_SOURCES"] = json.dumps(sources)
+        env["INITIAL_STATE"] = initial_state
+        run = subprocess.run([sys.executable, "run_pipeline.py"], env=env, capture_output=True, text=True)
+
+        manifest_path = out_dir / "paper_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        budgets = manifest.get("budgets", {}) if isinstance(manifest, dict) else {}
+
+        state_path = out_dir / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+        state_stop = state.get("stop_reason") if isinstance(state, dict) else None
+
+        providers_dir = out_dir / "providers"
+        error_artifacts = []
+        if providers_dir.exists():
+            error_artifacts = [p for p in providers_dir.rglob("*_error.json") if p.is_file()]
+
+        return {
+            "returncode": run.returncode,
+            "budgets": budgets,
+            "state_stop_reason": state_stop,
+            "error_artifact_count": len(error_artifacts),
+        }
+
+    try:
+        degrade = _run_case(out_degrade, "0")
+        fail_fast = _run_case(out_failfast, "1")
+    finally:
+        server_process.terminate()
+        server_process.wait()
+
+    degrade_usage = degrade["budgets"].get("usage", {}) if isinstance(degrade.get("budgets"), dict) else {}
+    degrade_reason = str(degrade["budgets"].get("budget_stop_reason", "none")) if isinstance(degrade.get("budgets"), dict) else "none"
+    degrade_ok = (
+        degrade["returncode"] == 0
+        and bool(degrade["budgets"].get("budgets_enforced", False))
+        and degrade_reason in {"budget_pdf_limit_reached", "budget_pdf_bytes_limit_reached"}
+        and int(degrade_usage.get("budget_skip_count", 0)) >= 1
+    )
+
+    ff_reason = str(fail_fast.get("state_stop_reason") or "")
+    failfast_ok = (
+        ((fail_fast["returncode"] != 0) or (ff_reason == "budget_pdf_limit_reached"))
+        and (fail_fast["error_artifact_count"] >= 1)
+        and (ff_reason in {"budget_pdf_limit_reached", "budget_pdf_bytes_limit_reached"})
+    )
+
+    return {
+        "pass": degrade_ok and failfast_ok,
+        "degrade": degrade,
+        "fail_fast": fail_fast,
+    }
+
+
 def main():
     minireal = run_minireal_quality_gate_test()
     leakage = run_leakage_controlled_fail_test()
     shuffle = run_label_shuffle_controlled_fail_test()
     determinism = run_manifest_determinism_test()
     cli = run_cli_smoke_test()
+    dedup_case = run_dedup_controlled_case_test()
+    budget_case = run_budget_controlled_case_test()
 
     score = 10
     if not minireal.get("pass"):
@@ -2190,6 +2372,10 @@ def main():
         score -= 1
     if not cli.get("pass"):
         score -= 4
+    if not dedup_case.get("pass"):
+        score -= 2
+    if not budget_case.get("pass"):
+        score -= 2
     if score < 0:
         score = 0
 
@@ -2215,6 +2401,10 @@ def main():
         "milestone5": {
             "cli_smoke": bool(cli.get("pass")),
         },
+        "milestone7": {
+            "dedup_controlled_case": bool(dedup_case.get("pass")),
+            "budget_controlled_case": bool(budget_case.get("pass")),
+        },
     }
 
     print(f"ACCEPTANCE_JSON={json.dumps(acceptance, sort_keys=True)}")
@@ -2225,6 +2415,8 @@ def main():
         and shuffle.get("pass")
         and determinism.get("pass")
         and cli.get("pass")
+        and dedup_case.get("pass")
+        and budget_case.get("pass")
         and (minireal.get("stats", {}).get("avg_precision", 0.0) >= 0.05)
     )
     sys.exit(0 if all_ok else 1)
