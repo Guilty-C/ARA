@@ -2536,6 +2536,109 @@ def run_scorer_determinism_test():
     }
 
 
+def run_evidence_gate_test():
+    print("--- Running Evidence Gate Test ---")
+    out_dir = Path("outputs_test/evidence_gate_run")
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg_path = Path("outputs_test/evidence_gate_config.json")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        json.dumps({"topic": "industrial anomaly detection", "constraints": {"compute": "low"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    server_env = os.environ.copy()
+    server_env["PORT"] = "8105"
+    server_process = subprocess.Popen(
+        [sys.executable, "tools_server/dummy_tool_server.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=server_env,
+    )
+    if not wait_for_port("127.0.0.1", 8105):
+        return {"pass": False, "error": "server_start_failed"}
+
+    try:
+        env = os.environ.copy()
+        env["TOOL_API_BASE"] = "http://127.0.0.1:8105"
+        env["API_BASE_URL"] = "http://127.0.0.1:8105/api"
+        env["PROVIDER_MODE"] = "REPLAY"
+        env["MOCK_TIMESTAMP"] = "1234567890"
+        run = subprocess.run(
+            [sys.executable, "-m", "ara", "run", "--output-dir", str(out_dir), "--config", str(cfg_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        server_process.terminate()
+        server_process.wait()
+
+    evidence_path = out_dir / "evidence_index.json"
+    claims_path = out_dir / "claims.json"
+    bib_path = out_dir / "citations.bib"
+    if run.returncode != 0 or (not evidence_path.exists()) or (not claims_path.exists()) or (not bib_path.exists()):
+        return {
+            "pass": False,
+            "returncode": run.returncode,
+            "missing": {
+                "evidence_index": not evidence_path.exists(),
+                "claims": not claims_path.exists(),
+                "citations_bib": not bib_path.exists(),
+            },
+        }
+
+    try:
+        evidence_index = json.loads(evidence_path.read_text(encoding="utf-8"))
+        claims = json.loads(claims_path.read_text(encoding="utf-8"))
+        bib_text = bib_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return {"pass": False, "error": f"decode_failed:{exc}"}
+
+    if not isinstance(evidence_index, list) or not isinstance(claims, list):
+        return {"pass": False, "error": "invalid_schema"}
+
+    snippet_ok = True
+    locator_ok = True
+    sha_ok = True
+    for ev in evidence_index:
+        if not isinstance(ev, dict):
+            snippet_ok = False
+            locator_ok = False
+            sha_ok = False
+            break
+        snippet = str(ev.get("snippet", ""))
+        if len(snippet) > 200:
+            snippet_ok = False
+        locator = ev.get("locator", {})
+        if not (isinstance(locator, dict) and isinstance(locator.get("page"), int)):
+            locator_ok = False
+        sha = str(ev.get("sha256", ""))
+        if len(sha) != 64:
+            sha_ok = False
+
+    has_claim_with_evidence = any(
+        isinstance(c, dict) and isinstance(c.get("evidence_ids"), list) and len(c.get("evidence_ids")) > 0 for c in claims
+    )
+    bib_ok = ("@article{" in bib_text) and (("title =" in bib_text) or ("year =" in bib_text))
+
+    passed = bool(evidence_index) and snippet_ok and locator_ok and sha_ok and has_claim_with_evidence and bib_ok
+    return {
+        "pass": passed,
+        "returncode": run.returncode,
+        "evidence_count": len(evidence_index),
+        "claims_count": len(claims),
+        "has_claim_with_evidence": has_claim_with_evidence,
+        "snippet_ok": snippet_ok,
+        "locator_ok": locator_ok,
+        "sha_ok": sha_ok,
+        "bib_ok": bib_ok,
+    }
+
+
 def main():
     minireal = run_minireal_quality_gate_test()
     leakage = run_leakage_controlled_fail_test()
@@ -2546,6 +2649,7 @@ def main():
     budget_case = run_budget_controlled_case_test()
     iterate_case = run_iteration_smoke_test()
     scorer_det = run_scorer_determinism_test()
+    evidence_gate = run_evidence_gate_test()
 
     score = 10
     if not minireal.get("pass"):
@@ -2567,6 +2671,8 @@ def main():
     if not iterate_case.get("pass"):
         score -= 2
     if not scorer_det.get("pass"):
+        score -= 2
+    if not evidence_gate.get("pass"):
         score -= 2
     if score < 0:
         score = 0
@@ -2603,6 +2709,9 @@ def main():
         "milestone9": {
             "scorer_determinism": bool(scorer_det.get("pass")),
         },
+        "milestone10": {
+            "evidence_gate": bool(evidence_gate.get("pass")),
+        },
     }
 
     print(f"ACCEPTANCE_JSON={json.dumps(acceptance, sort_keys=True)}")
@@ -2617,6 +2726,7 @@ def main():
         and budget_case.get("pass")
         and iterate_case.get("pass")
         and scorer_det.get("pass")
+        and evidence_gate.get("pass")
         and (minireal.get("stats", {}).get("avg_precision", 0.0) >= 0.05)
     )
     sys.exit(0 if all_ok else 1)

@@ -313,6 +313,169 @@ def _scan_provider_budgets(output_dir: Path) -> dict:
         "stop_reason_top": stop_counter.most_common(5),
     }
 
+
+def _canonical_snippet(text: str) -> str:
+    compact = _collapse_spaces(str(text or ""))
+    return compact[:200]
+
+
+def _snippet_sha256(snippet: str) -> str:
+    return hashlib.sha256(snippet.encode("utf-8")).hexdigest()
+
+
+def _escape_bib_value(value: str) -> str:
+    text = str(value or "")
+    return text.replace("{", "\\{").replace("}", "\\}")
+
+
+def _build_citations_bib(st: ResearchState) -> str:
+    rows = []
+    records = st.work_records if isinstance(st.work_records, list) else []
+    for i, rec in enumerate(records):
+        if not isinstance(rec, dict):
+            continue
+        title = _collapse_spaces(str(rec.get("title", "")))
+        if not title:
+            continue
+        doi = _normalize_doi(rec.get("doi"))
+        year = rec.get("year")
+        year_val = str(year) if isinstance(year, int) else ""
+        authors = rec.get("authors", [])
+        if isinstance(authors, list):
+            author_text = " and ".join(
+                [_collapse_spaces(str(a)) for a in authors if _collapse_spaces(str(a))]
+            )
+        else:
+            author_text = ""
+        base = doi if doi else title.lower()
+        citekey = f"ara{hashlib.sha256(base.encode('utf-8')).hexdigest()[:12]}"
+        rows.append(
+            {
+                "idx": i,
+                "citekey": citekey,
+                "title": title,
+                "author": author_text or "unknown",
+                "year": year_val or "unknown",
+                "doi": doi or "",
+            }
+        )
+
+    if not rows and isinstance(st.annotated_bib, list):
+        for i, rec in enumerate(st.annotated_bib):
+            if not isinstance(rec, dict):
+                continue
+            title = _collapse_spaces(str(rec.get("title", "")))
+            if not title:
+                continue
+            year = rec.get("year")
+            year_val = str(year) if isinstance(year, int) else ""
+            base = title.lower()
+            citekey = f"ara{hashlib.sha256(base.encode('utf-8')).hexdigest()[:12]}"
+            rows.append(
+                {
+                    "idx": i,
+                    "citekey": citekey,
+                    "title": title,
+                    "author": "unknown",
+                    "year": year_val or "unknown",
+                    "doi": "",
+                }
+            )
+
+    rows = sorted(rows, key=lambda r: (r["citekey"], r["title"].lower(), r["idx"]))
+    lines = []
+    for row in rows:
+        lines.append(f"@article{{{row['citekey']},")
+        lines.append(f"  title = {{{_escape_bib_value(row['title'])}}},")
+        lines.append(f"  author = {{{_escape_bib_value(row['author'])}}},")
+        lines.append(f"  year = {{{_escape_bib_value(row['year'])}}},")
+        if row["doi"]:
+            lines.append(f"  doi = {{{_escape_bib_value(row['doi'])}}},")
+        lines.append("}")
+        lines.append("")
+    return ("\n".join(lines).strip() + "\n") if lines else ""
+
+
+def _build_evidence_and_claims(st: ResearchState) -> tuple[list[dict], list[dict]]:
+    evidence_rows = st.evidence_table if isinstance(st.evidence_table, list) else []
+    bib = st.annotated_bib if isinstance(st.annotated_bib, list) else []
+    evidence_index: list[dict] = []
+    claim_to_evidence: dict[int, list[str]] = {}
+
+    for row_idx, row in enumerate(evidence_rows):
+        if not isinstance(row, dict):
+            continue
+        snippets = row.get("support_snippets", [])
+        if not isinstance(snippets, list):
+            snippets = []
+        source_id = {
+            "work_id": str(row.get("paper_id", "")) or None,
+            "doi": _normalize_doi(row.get("doi")),
+            "pdf_path": str(row.get("pdf_path", "")) or None,
+            "url": str(row.get("source_url", "")) or None,
+        }
+        provenance = row.get("provenance")
+        if not isinstance(provenance, dict):
+            provenance = {"stage": "literature", "row_index": row_idx}
+
+        for sn_idx, snippet_raw in enumerate(snippets):
+            snippet = _canonical_snippet(str(snippet_raw))
+            if not snippet:
+                continue
+            source_seed = json.dumps(source_id, sort_keys=True, ensure_ascii=False)
+            evidence_id = f"ev_{hashlib.sha256((source_seed + '|' + snippet).encode('utf-8')).hexdigest()[:12]}"
+            evidence_index.append(
+                {
+                    "evidence_id": evidence_id,
+                    "source_id": source_id,
+                    "locator": {"page": 1, "snippet_index": sn_idx},
+                    "snippet": snippet,
+                    "sha256": _snippet_sha256(snippet),
+                    "provenance": provenance,
+                }
+            )
+            claim_to_evidence.setdefault(row_idx, []).append(evidence_id)
+
+    evidence_index = sorted(evidence_index, key=lambda e: (e.get("evidence_id", ""), e.get("sha256", "")))
+
+    claims: list[dict] = []
+    for row_idx, row in enumerate(evidence_rows):
+        if not isinstance(row, dict):
+            continue
+        claim_text = _collapse_spaces(str(row.get("claim", f"claim {row_idx + 1}")))
+        ev_ids = sorted(set(claim_to_evidence.get(row_idx, [])))
+        citation_keys = []
+        if bib:
+            b = bib[row_idx % len(bib)]
+            if isinstance(b, dict):
+                ck = _collapse_spaces(str(b.get("citation_key", "")))
+                if ck:
+                    citation_keys.append(ck)
+        claims.append(
+            {
+                "claim_id": f"cl_{row_idx + 1:04d}",
+                "text": claim_text,
+                "required_evidence_count": 1,
+                "evidence_ids": ev_ids,
+                "citation_keys": citation_keys,
+                "blocked": len(ev_ids) < 1,
+            }
+        )
+
+    if not claims:
+        claims = [
+            {
+                "claim_id": "cl_0001",
+                "text": "No supported claim extracted.",
+                "required_evidence_count": 1,
+                "evidence_ids": [],
+                "citation_keys": [],
+                "blocked": True,
+            }
+        ]
+    claims = sorted(claims, key=lambda c: c["claim_id"])
+    return evidence_index, claims
+
 class TopicStage:
     name = "topic"
     def can_run(self, st: ResearchState) -> bool:
@@ -1009,9 +1172,23 @@ class PaperStage:
             }
             st.budgets = budget_payload
             manifest["budgets"] = budget_payload
+            evidence_index, claims = _build_evidence_and_claims(st)
+            citations_bib = _build_citations_bib(st)
+            manifest["evidence_gate"] = {
+                "evidence_count": len(evidence_index),
+                "claims_count": len(claims),
+                "blocked_claims_count": sum(1 for c in claims if bool(c.get("blocked"))),
+            }
 
             (out_dir / "paper.md").write_text(st.paper_md, encoding="utf-8")
             (out_dir / "paper_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            (out_dir / "evidence_index.json").write_text(
+                json.dumps(evidence_index, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            (out_dir / "claims.json").write_text(
+                json.dumps(claims, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            (out_dir / "citations.bib").write_text(citations_bib, encoding="utf-8")
             
             tools.summarize(
                 f"Paper generated with {len(manifest.get('figures', []))} figures and {len(manifest.get('citations', []))} citations."

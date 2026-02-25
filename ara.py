@@ -175,7 +175,17 @@ def _evaluate_iter_dir(iter_dir: Path) -> tuple[dict, dict]:
 
 
 def _sync_iter_to_run_dir(run_dir: Path, iter_dir: Path) -> None:
-    for name in ["paper.md", "paper_manifest.json", "evidence_table.json", "critic_report.json", "state.json"]:
+    for name in [
+        "paper.md",
+        "paper_manifest.json",
+        "evidence_table.json",
+        "critic_report.json",
+        "state.json",
+        "review_score.json",
+        "evidence_index.json",
+        "claims.json",
+        "citations.bib",
+    ]:
         src = iter_dir / name
         dst = run_dir / name
         if src.exists():
@@ -628,7 +638,16 @@ def cmd_report(args: argparse.Namespace) -> int:
         else:
             print("recommended_actions=none")
 
-    for name in ["paper.md", "paper_manifest.json", "evidence_table.json", "critic_report.json"]:
+    for name in [
+        "paper.md",
+        "paper_manifest.json",
+        "evidence_table.json",
+        "critic_report.json",
+        "review_score.json",
+        "evidence_index.json",
+        "claims.json",
+        "citations.bib",
+    ]:
         p = out_dir / name
         if p.exists():
             print(f"{name}={p}")
@@ -1008,7 +1027,17 @@ def cmd_bundle(args: argparse.Namespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     include_files: list[Path] = []
-    fixed = ["paper.md", "paper_manifest.json", "evidence_table.json", "critic_report.json", "state.json"]
+    fixed = [
+        "paper.md",
+        "paper_manifest.json",
+        "evidence_table.json",
+        "critic_report.json",
+        "state.json",
+        "review_score.json",
+        "evidence_index.json",
+        "claims.json",
+        "citations.bib",
+    ]
     for name in fixed:
         p = run_dir / name
         if p.exists() and p.is_file():

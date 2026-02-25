@@ -1,12 +1,29 @@
 import json
+import os
+from pathlib import Path
 from typing import Dict, Any, List
 from sr_pipeline.state import ResearchState
 
 class CriticAgent:
+    def _load_blocked_claims_count(self) -> int:
+        out_dir = Path(os.environ.get("OUTPUT_DIR", "outputs"))
+        claims_path = out_dir / "claims.json"
+        if not claims_path.exists():
+            return 0
+        try:
+            payload = json.loads(claims_path.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
+        if not isinstance(payload, list):
+            return 0
+        return sum(1 for row in payload if isinstance(row, dict) and bool(row.get("blocked")))
+
     def _build_structured_score(self, st: ResearchState, issues: List[Dict[str, Any]]) -> Dict[str, Any]:
         evidence_rows = st.evidence_table if isinstance(st.evidence_table, list) else []
         evidence_count = len(evidence_rows)
         missing_support = sum(1 for r in evidence_rows if isinstance(r, dict) and not r.get("support_snippets"))
+        blocked_claims_count = self._load_blocked_claims_count()
+        missing_support_total = missing_support + blocked_claims_count
         has_experiment = isinstance(st.experiment_results, dict)
         has_seed_sweep = bool(
             isinstance(st.experiment_results, dict)
@@ -18,19 +35,19 @@ class CriticAgent:
         rubric = {
             "coverage": min(10, evidence_count),
             "correctness": 10 if not any(i.get("severity") == "HIGH" for i in issues) else 4,
-            "evidence_quality": max(0, 10 - min(10, missing_support * 2)),
+            "evidence_quality": max(0, 10 - min(10, missing_support_total * 2)),
             "novelty": min(10, len(st.hypotheses) * 3) if isinstance(st.hypotheses, list) else 0,
             "reproducibility": 10 if has_experiment else 2,
             "ablation_quality": 10 if has_seed_sweep else 3,
         }
 
         penalties: List[Dict[str, Any]] = []
-        if missing_support > 0:
+        if missing_support_total > 0:
             penalties.append(
                 {
                     "code": "claim_without_evidence",
-                    "points": min(10, missing_support * 2),
-                    "count": missing_support,
+                    "points": min(10, missing_support_total * 2),
+                    "count": missing_support_total,
                 }
             )
         if has_experiment:
@@ -57,8 +74,9 @@ class CriticAgent:
         )
 
         recommendations_set: set[str] = set()
-        if missing_support > 0:
+        if missing_support_total > 0:
             recommendations_set.add("extract_evidence")
+            recommendations_set.add("fetch_more_evidence")
         if any(p.get("code") == "missing_ablation" for p in penalties):
             recommendations_set.add("add_ablation")
         if not has_seed_sweep:
