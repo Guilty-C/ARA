@@ -709,10 +709,16 @@ class CriticStage:
             report = critic.run(st)
             report["iteration_plan"]["attempt"] = attempt
             st.critic_report = report
+            if isinstance(report.get("score"), dict):
+                st.iter_state["score"] = report["score"]
             
             # Persist
             out_dir = Path(os.environ.get("OUTPUT_DIR", "outputs"))
             (out_dir / "critic_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            if isinstance(report.get("score"), dict):
+                (out_dir / "review_score.json").write_text(
+                    json.dumps(report["score"], indent=2, ensure_ascii=False), encoding="utf-8"
+                )
             return st
             
         report = critic.run(st)
@@ -740,10 +746,16 @@ class CriticStage:
 
         report["iteration_plan"]["attempt"] = attempt + 1
         st.critic_report = report
+        if isinstance(report.get("score"), dict):
+            st.iter_state["score"] = report["score"]
         
         # Persist
         out_dir = Path(os.environ.get("OUTPUT_DIR", "outputs"))
         (out_dir / "critic_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        if isinstance(report.get("score"), dict):
+            (out_dir / "review_score.json").write_text(
+                json.dumps(report["score"], indent=2, ensure_ascii=False), encoding="utf-8"
+            )
         
         # 2. Iteration Policy
         if not report["critic_pass"]:

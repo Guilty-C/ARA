@@ -104,6 +104,12 @@ def _clamp(x: float, low: float, high: float) -> float:
 
 
 def _evaluate_iter_dir(iter_dir: Path) -> tuple[dict, dict]:
+    review = _load_json(iter_dir / "review_score.json")
+    if isinstance(review, dict) and isinstance(review.get("overall_score"), (int, float)):
+        manifest = _load_json(iter_dir / "paper_manifest.json") or {}
+        budgets = manifest.get("budgets", {}) if isinstance(manifest, dict) else {}
+        return review, budgets if isinstance(budgets, dict) else {}
+
     state = _load_json(iter_dir / "state.json") or {}
     manifest = _load_json(iter_dir / "paper_manifest.json") or {}
     budgets = manifest.get("budgets", {}) if isinstance(manifest, dict) else {}
@@ -195,6 +201,11 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_iterate(args: argparse.Namespace) -> int:
     mode = (args.mode or "REPLAY").upper()
+    if args.no_live:
+        if mode == "LIVE":
+            print("error: --no-live cannot be used with --mode LIVE", file=sys.stderr)
+            return 2
+        mode = "REPLAY"
     if mode not in {"REPLAY", "LIVE"}:
         print("error: --mode must be REPLAY or LIVE", file=sys.stderr)
         return 2
@@ -225,6 +236,7 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         next_idx = len(existing_iters) + 1
         best_score = float(resume_manifest.get("decision", {}).get("best_score", 0))
         history = []
+        best_iter_dir = None
         for it in existing_iters:
             m = _load_json(it / "iteration_manifest.json")
             if isinstance(m, dict):
@@ -233,6 +245,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
                     s = ev.get("overall_score")
                     if isinstance(s, (int, float)):
                         history.append(float(s))
+                        if float(s) >= best_score:
+                            best_score = float(s)
+                            best_iter_dir = str(it)
+        history = history[-int(args.no_progress_k) :]
     else:
         if not args.output_root:
             print("error: iterate requires --output-root when --resume is not used", file=sys.stderr)
@@ -245,12 +261,20 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         next_idx = 1
         best_score = -1.0
         history = []
-
-    best_iter_dir = None
+        best_iter_dir = None
     rounds_without_progress = 0
     final_stop_reason = "no_progress_k_rounds"
     iters_run = 0
     parent_iter_id = None
+
+    cumulative_usage = {
+        "calls_total": 0,
+        "fail_count": 0,
+        "pdf_bytes": 0,
+        "pdf_count": 0,
+        "retries_total": 0,
+        "budget_skip_count": 0,
+    }
 
     for step in range(args.max_iters):
         iter_num = next_idx + step
@@ -286,10 +310,27 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             budget_stop = str(budgets.get("budget_stop_reason", "none") or "none")
             budget_limits = budgets.get("budget_limits", {}) if isinstance(budgets.get("budget_limits"), dict) else {}
             budget_usage = budgets.get("usage", {}) if isinstance(budgets.get("usage"), dict) else {}
+        for key in list(cumulative_usage.keys()):
+            value = budget_usage.get(key)
+            if cumulative_usage[key] is None:
+                continue
+            if isinstance(value, int):
+                cumulative_usage[key] += value
+            elif value is None:
+                cumulative_usage[key] = None
+            else:
+                cumulative_usage[key] = None
 
         stop_reason = "none"
+        recommended_actions = []
+        if isinstance(evaluation, dict):
+            ra = evaluation.get("recommended_actions")
+            if isinstance(ra, list):
+                recommended_actions = [str(x) for x in ra]
         if run_rc != 0:
             stop_reason = "tool_failure"
+        elif "fetch_more_evidence" in recommended_actions:
+            stop_reason = "evidence_gap"
         elif overall_score >= float(args.target_score):
             stop_reason = "reached_target_score"
         elif budget_stop != "none":
@@ -302,7 +343,10 @@ def cmd_iterate(args: argparse.Namespace) -> int:
         review_payload = {
             "iter_id": iter_id,
             "overall_score": overall_score,
-            "rubric": evaluation.get("rubric", {}),
+            "rubric": evaluation.get("rubric", {}) if isinstance(evaluation.get("rubric"), dict) else {},
+            "penalties": evaluation.get("penalties", []) if isinstance(evaluation.get("penalties"), list) else [],
+            "recommended_actions": recommended_actions,
+            "rationale": str(evaluation.get("rationale", "")) if isinstance(evaluation, dict) else "",
         }
         (iter_dir / "review_score.json").write_text(json.dumps(review_payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -318,13 +362,14 @@ def cmd_iterate(args: argparse.Namespace) -> int:
             "evaluation": evaluation,
             "decision": {
                 "stop_reason": stop_reason,
-                "next_actions": [] if stop_reason != "none" else ["expand_search"],
+                "next_actions": recommended_actions if recommended_actions else ([] if stop_reason != "none" else ["expand_search"]),
                 "best_score": best_score,
             },
             "budgets": {
                 "usage": budget_usage,
                 "limits": budget_limits,
                 "budget_stop_reason": budget_stop,
+                "cumulative": cumulative_usage,
             },
             "artifacts": {
                 "iter_dir": str(iter_dir),
@@ -460,6 +505,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     critic = _load_json(out_dir / "critic_report.json")
     evidence = _load_json(out_dir / "evidence_table.json")
     manifest = _load_json(out_dir / "paper_manifest.json")
+    review_score = _load_json(out_dir / "review_score.json")
 
     stages = []
     events_path = out_dir / "logs" / "events.jsonl"
@@ -542,6 +588,34 @@ def cmd_report(args: argparse.Namespace) -> int:
     if isinstance(cluster_stats, dict):
         print(f"cluster_count={cluster_stats.get('cluster_count', 'unknown')}")
         print(f"largest_cluster_size={cluster_stats.get('largest_cluster_size', 'unknown')}")
+
+    if not isinstance(review_score, dict) and isinstance(critic, dict):
+        cand = critic.get("score")
+        if isinstance(cand, dict):
+            review_score = cand
+    if isinstance(review_score, dict):
+        overall = review_score.get("overall_score", "unknown")
+        rubric = review_score.get("rubric", {})
+        penalties = review_score.get("penalties", [])
+        actions = review_score.get("recommended_actions", [])
+        print(f"overall_score={overall}")
+        if isinstance(rubric, dict):
+            rubric_summary = ",".join([f"{k}:{rubric[k]}" for k in sorted(rubric.keys())])
+            print(f"rubric_summary={rubric_summary if rubric_summary else 'none'}")
+        else:
+            print("rubric_summary=none")
+        if isinstance(penalties, list):
+            top_pen = []
+            for p in penalties[:5]:
+                if isinstance(p, dict):
+                    top_pen.append(f"{p.get('code','unknown')}:{p.get('points',0)}")
+            print(f"top_penalties={','.join(top_pen) if top_pen else 'none'}")
+        else:
+            print("top_penalties=none")
+        if isinstance(actions, list):
+            print(f"recommended_actions={','.join([str(a) for a in actions]) if actions else 'none'}")
+        else:
+            print("recommended_actions=none")
 
     for name in ["paper.md", "paper_manifest.json", "evidence_table.json", "critic_report.json"]:
         p = out_dir / name
@@ -971,6 +1045,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_iter.add_argument("--max-iters", type=int, default=2)
     p_iter.add_argument("--target-score", type=float, default=80.0)
     p_iter.add_argument("--mode", choices=["REPLAY", "LIVE"], default="REPLAY")
+    p_iter.add_argument("--no-live", action="store_true")
     p_iter.add_argument("--no-progress-k", type=int, default=2)
     p_iter.add_argument("--policy", default="simple")
     p_iter.add_argument("--resume")

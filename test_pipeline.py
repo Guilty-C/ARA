@@ -2424,7 +2424,7 @@ def run_iteration_smoke_test():
         if (run_dir / "iters").exists():
             iter_dirs = [p for p in (run_dir / "iters").iterdir() if p.is_dir()]
         stop_reason = str(result.get("stop_reason", "")) if isinstance(result, dict) else ""
-        allowed = {"reached_target_score", "budget_exhausted", "no_progress_k_rounds", "tool_failure"}
+        allowed = {"reached_target_score", "budget_exhausted", "no_progress_k_rounds", "tool_failure", "evidence_gap"}
 
         ok = (
             run.returncode == 0
@@ -2444,6 +2444,71 @@ def run_iteration_smoke_test():
         server_process.wait()
 
 
+def run_scorer_determinism_test():
+    print("--- Running Scorer Determinism Test ---")
+    out_a = Path("outputs_test/scorer_det_a")
+    out_b = Path("outputs_test/scorer_det_b")
+    for d in [out_a, out_b]:
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True, exist_ok=True)
+
+    cfg_path = Path("outputs_test/scorer_det_config.json")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        json.dumps({"topic": "industrial anomaly detection", "constraints": {"compute": "low"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    server_env = os.environ.copy()
+    server_env["PORT"] = "8104"
+    server_process = subprocess.Popen(
+        [sys.executable, "tools_server/dummy_tool_server.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=server_env,
+    )
+    if not wait_for_port("127.0.0.1", 8104):
+        return {"pass": False, "error": "server_start_failed"}
+
+    def _run_once(out_dir: Path):
+        env = os.environ.copy()
+        env["TOOL_API_BASE"] = "http://127.0.0.1:8104"
+        env["API_BASE_URL"] = "http://127.0.0.1:8104/api"
+        env["PROVIDER_MODE"] = "REPLAY"
+        env["MOCK_TIMESTAMP"] = "1234567890"
+        run = subprocess.run(
+            [sys.executable, "-m", "ara", "run", "--output-dir", str(out_dir), "--config", str(cfg_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        review = {}
+        review_path = out_dir / "review_score.json"
+        if review_path.exists():
+            review = json.loads(review_path.read_text(encoding="utf-8"))
+        return run.returncode, review
+
+    try:
+        rc_a, review_a = _run_once(out_a)
+        rc_b, review_b = _run_once(out_b)
+    finally:
+        server_process.terminate()
+        server_process.wait()
+
+    same = (
+        isinstance(review_a, dict)
+        and isinstance(review_b, dict)
+        and review_a.get("overall_score") == review_b.get("overall_score")
+        and review_a.get("rubric") == review_b.get("rubric")
+    )
+    return {
+        "pass": (rc_a == 0 and rc_b == 0 and same),
+        "overall_a": review_a.get("overall_score") if isinstance(review_a, dict) else None,
+        "overall_b": review_b.get("overall_score") if isinstance(review_b, dict) else None,
+    }
+
+
 def main():
     minireal = run_minireal_quality_gate_test()
     leakage = run_leakage_controlled_fail_test()
@@ -2453,6 +2518,7 @@ def main():
     dedup_case = run_dedup_controlled_case_test()
     budget_case = run_budget_controlled_case_test()
     iterate_case = run_iteration_smoke_test()
+    scorer_det = run_scorer_determinism_test()
 
     score = 10
     if not minireal.get("pass"):
@@ -2472,6 +2538,8 @@ def main():
     if not budget_case.get("pass"):
         score -= 2
     if not iterate_case.get("pass"):
+        score -= 2
+    if not scorer_det.get("pass"):
         score -= 2
     if score < 0:
         score = 0
@@ -2505,6 +2573,9 @@ def main():
         "milestone8": {
             "iteration_smoke": bool(iterate_case.get("pass")),
         },
+        "milestone9": {
+            "scorer_determinism": bool(scorer_det.get("pass")),
+        },
     }
 
     print(f"ACCEPTANCE_JSON={json.dumps(acceptance, sort_keys=True)}")
@@ -2518,6 +2589,7 @@ def main():
         and dedup_case.get("pass")
         and budget_case.get("pass")
         and iterate_case.get("pass")
+        and scorer_det.get("pass")
         and (minireal.get("stats", {}).get("avg_precision", 0.0) >= 0.05)
     )
     sys.exit(0 if all_ok else 1)
