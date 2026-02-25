@@ -110,6 +110,14 @@ def _evaluate_iter_dir(iter_dir: Path) -> tuple[dict, dict]:
         budgets = manifest.get("budgets", {}) if isinstance(manifest, dict) else {}
         return review, budgets if isinstance(budgets, dict) else {}
 
+    critic = _load_json(iter_dir / "critic_report.json")
+    if isinstance(critic, dict):
+        score_block = critic.get("score")
+        if isinstance(score_block, dict) and isinstance(score_block.get("overall_score"), (int, float)):
+            manifest = _load_json(iter_dir / "paper_manifest.json") or {}
+            budgets = manifest.get("budgets", {}) if isinstance(manifest, dict) else {}
+            return score_block, budgets if isinstance(budgets, dict) else {}
+
     state = _load_json(iter_dir / "state.json") or {}
     manifest = _load_json(iter_dir / "paper_manifest.json") or {}
     budgets = manifest.get("budgets", {}) if isinstance(manifest, dict) else {}
@@ -159,6 +167,9 @@ def _evaluate_iter_dir(iter_dir: Path) -> tuple[dict, dict]:
             "experiment_accuracy_mean": accuracy_mean,
             "fail_count": fail_count,
         },
+        "penalties": [],
+        "recommended_actions": [],
+        "rationale": "fallback_heuristic",
     }
     return evaluation, budgets if isinstance(budgets, dict) else {}
 

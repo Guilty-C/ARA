@@ -2489,6 +2489,36 @@ def run_scorer_determinism_test():
             review = json.loads(review_path.read_text(encoding="utf-8"))
         return run.returncode, review
 
+    def _norm_review(review: dict) -> dict:
+        if not isinstance(review, dict):
+            return {}
+        penalties = review.get("penalties", [])
+        if isinstance(penalties, list):
+            norm_penalties = []
+            for p in penalties:
+                if isinstance(p, dict):
+                    norm_penalties.append(
+                        {
+                            "code": str(p.get("code", "")),
+                            "points": int(p.get("points", 0)),
+                            "count": int(p.get("count", 0)),
+                        }
+                    )
+            norm_penalties = sorted(norm_penalties, key=lambda x: (x["code"], x["points"], x["count"]))
+        else:
+            norm_penalties = []
+
+        actions = review.get("recommended_actions", [])
+        norm_actions = sorted([str(a) for a in actions]) if isinstance(actions, list) else []
+
+        return {
+            "overall_score": review.get("overall_score"),
+            "rubric": review.get("rubric", {}) if isinstance(review.get("rubric"), dict) else {},
+            "penalties": norm_penalties,
+            "recommended_actions": norm_actions,
+            "rationale": str(review.get("rationale", "")),
+        }
+
     try:
         rc_a, review_a = _run_once(out_a)
         rc_b, review_b = _run_once(out_b)
@@ -2496,16 +2526,13 @@ def run_scorer_determinism_test():
         server_process.terminate()
         server_process.wait()
 
-    same = (
-        isinstance(review_a, dict)
-        and isinstance(review_b, dict)
-        and review_a.get("overall_score") == review_b.get("overall_score")
-        and review_a.get("rubric") == review_b.get("rubric")
-    )
+    norm_a = _norm_review(review_a)
+    norm_b = _norm_review(review_b)
+    same = (norm_a == norm_b) and bool(norm_a)
     return {
         "pass": (rc_a == 0 and rc_b == 0 and same),
-        "overall_a": review_a.get("overall_score") if isinstance(review_a, dict) else None,
-        "overall_b": review_b.get("overall_score") if isinstance(review_b, dict) else None,
+        "overall_a": norm_a.get("overall_score"),
+        "overall_b": norm_b.get("overall_score"),
     }
 
 

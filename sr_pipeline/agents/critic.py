@@ -21,7 +21,7 @@ class CriticAgent:
             "evidence_quality": max(0, 10 - min(10, missing_support * 2)),
             "novelty": min(10, len(st.hypotheses) * 3) if isinstance(st.hypotheses, list) else 0,
             "reproducibility": 10 if has_experiment else 2,
-            "ablation_quality": 8 if has_seed_sweep else 3,
+            "ablation_quality": 10 if has_seed_sweep else 3,
         }
 
         penalties: List[Dict[str, Any]] = []
@@ -29,7 +29,7 @@ class CriticAgent:
             penalties.append(
                 {
                     "code": "claim_without_evidence",
-                    "points": min(20, missing_support * 2),
+                    "points": min(10, missing_support * 2),
                     "count": missing_support,
                 }
             )
@@ -39,7 +39,7 @@ class CriticAgent:
                 penalties.append(
                     {
                         "code": "missing_ablation",
-                        "points": 5,
+                        "points": 6,
                         "count": 1,
                     }
                 )
@@ -47,32 +47,40 @@ class CriticAgent:
             penalties.append(
                 {
                     "code": "inconsistent_citations",
-                    "points": 5,
+                    "points": 4,
                     "count": 1,
                 }
             )
+        penalties = sorted(
+            penalties,
+            key=lambda p: (str(p.get("code", "")), int(p.get("points", 0)), int(p.get("count", 0))),
+        )
 
-        recommendations: List[str] = []
+        recommendations_set: set[str] = set()
         if missing_support > 0:
-            recommendations.append("extract_evidence")
+            recommendations_set.add("extract_evidence")
         if any(p.get("code") == "missing_ablation" for p in penalties):
-            recommendations.append("add_ablation")
+            recommendations_set.add("add_ablation")
         if not has_seed_sweep:
-            recommendations.append("rerun_with_seed")
+            recommendations_set.add("rerun_with_seed")
         if evidence_count < 3:
-            recommendations.append("fetch_more_evidence")
-        if not recommendations:
-            recommendations.append("stop_evidence_gap")
+            recommendations_set.add("fetch_more_evidence")
+        if not recommendations_set:
+            recommendations_set.add("stop_evidence_gap")
+        recommendations = sorted(recommendations_set)
 
+        raw_total = sum(int(v) for v in rubric.values())
+        raw_max = 60
+        base = round(100 * raw_total / raw_max)
         penalty_points = sum(int(p.get("points", 0)) for p in penalties)
-        overall = sum(int(v) for v in rubric.values()) - penalty_points
-        overall = max(0, min(100, overall))
+        penalty_points_scaled = round(penalty_points * 2.5)
+        overall = max(0, min(100, base - penalty_points_scaled))
         return {
             "overall_score": overall,
             "rubric": rubric,
             "penalties": penalties,
             "recommended_actions": recommendations,
-            "rationale": "Deterministic score from evidence counts, sanity checks, and structured penalties.",
+            "rationale": "Deterministic 0-100 score: normalized rubric total minus scaled structured penalties.",
         }
 
     def run(self, st: ResearchState) -> Dict[str, Any]:
