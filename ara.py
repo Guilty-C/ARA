@@ -247,6 +247,18 @@ def cmd_report(args: argparse.Namespace) -> int:
     print(f"budget_pdf_bytes={provider['pdf_bytes']}")
     print(f"budget_fail_count={provider['fail_count']}")
     print(f"budget_retries_total={provider['retries_total']}")
+    budget_enforced = False
+    budget_stop_reason = "none"
+    if isinstance(manifest, dict):
+        budgets = manifest.get("budgets")
+        if isinstance(budgets, dict):
+            budget_enforced = bool(budgets.get("budgets_enforced", False))
+            budget_stop_reason = str(budgets.get("budget_stop_reason", "none") or "none")
+    if not budget_enforced and isinstance(state, dict):
+        budget_enforced = bool(state.get("budget_enforced", False))
+        budget_stop_reason = str(state.get("budget_stop_reason", budget_stop_reason) or budget_stop_reason)
+    print(f"budget_enforced={'true' if budget_enforced else 'false'}")
+    print(f"budget_stop_reason={budget_stop_reason}")
 
     lit_stats = None
     cluster_stats = None

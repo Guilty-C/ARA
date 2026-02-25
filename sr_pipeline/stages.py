@@ -155,6 +155,99 @@ def _dedup_work_records(raw_records: list[dict]) -> tuple[list[dict], dict, dict
     return deduped, stats, clusters_summary
 
 
+def _read_initial_constraints() -> dict:
+    raw = os.environ.get("INITIAL_STATE", "")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    constraints = data.get("constraints")
+    return constraints if isinstance(constraints, dict) else {}
+
+
+def _to_int(value: object, default: int) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except Exception:
+            return default
+    return default
+
+
+def _read_literature_budget_limits() -> dict:
+    defaults = {
+        "max_works": 20,
+        "max_sources": 20,
+        "max_pdfs": 20,
+        "max_pdf_bytes": 50_000_000,
+    }
+    constraints = _read_initial_constraints()
+    lit = constraints.get("literature", {}) if isinstance(constraints, dict) else {}
+    if not isinstance(lit, dict):
+        lit = {}
+
+    limits = dict(defaults)
+    for key in defaults:
+        limits[key] = max(1, _to_int(lit.get(key), defaults[key]))
+
+    env_map = {
+        "LITERATURE_MAX_WORKS": "max_works",
+        "LITERATURE_MAX_SOURCES": "max_sources",
+        "LITERATURE_MAX_PDFS": "max_pdfs",
+        "LITERATURE_MAX_PDF_BYTES": "max_pdf_bytes",
+    }
+    for env_key, key in env_map.items():
+        raw = os.environ.get(env_key)
+        if raw is None:
+            continue
+        limits[key] = max(1, _to_int(raw, limits[key]))
+    return limits
+
+
+def _is_pdf_like_url(url: str) -> bool:
+    lower = url.lower()
+    return lower.endswith(".pdf") or ("/pdf" in lower) or ("url_for_pdf" in lower) or ("pdf" in lower)
+
+
+def _source_priority(record: dict, url: str) -> tuple:
+    pdf_priority = 0 if _is_pdf_like_url(url) else 1
+    provenance = record.get("provenance", {})
+    if not isinstance(provenance, dict):
+        provenance = {}
+    url_src = str(provenance.get("urls", "local")).lower()
+    prov_rank = 2
+    if "unpaywall" in url_src:
+        prov_rank = 0
+    elif "openalex" in url_src:
+        prov_rank = 1
+    return (pdf_priority, prov_rank, url.lower(), url)
+
+
+def _select_source_from_record(record: dict) -> str | None:
+    urls = record.get("urls", [])
+    if not isinstance(urls, list):
+        return None
+    unique_urls = sorted(set([str(u).strip() for u in urls if str(u).strip()]), key=lambda s: s.lower())
+    if not unique_urls:
+        return None
+    ranked = sorted(unique_urls, key=lambda u: _source_priority(record, u))
+    return ranked[0]
+
+
+def _handle_budget_breach(st: ResearchState, reason: str, fail_fast: bool) -> None:
+    st.budget_enforced = True
+    st.budget_stop_reason = reason
+    if fail_fast:
+        st.stop_reason = reason
+        raise RuntimeError(reason)
+
+
 def _scan_provider_budgets(output_dir: Path) -> dict:
     providers_dir = output_dir / "providers"
     if not providers_dir.exists():
@@ -380,8 +473,15 @@ class LiteratureStage:
     def run(self, st: ResearchState, tools: ToolRegistry, api: Optional[APIClient] = None) -> ResearchState:
         # Level-2: RAG-first literature review
         from sr_pipeline.literature.agent import LiteratureReviewAgent
+        from sr_pipeline.literature.ingest import get_last_budget_usage
         from sr_pipeline.providers import get_provider
-        
+        fail_fast = (os.environ.get("FAIL_FAST", "0") == "1") or (os.environ.get("FAIL_FAST_TOOL", "0") == "1")
+        limits = _read_literature_budget_limits()
+        st.budget_limits = limits
+        st.budget_enforced = False
+        st.budget_stop_reason = None
+        st.budget_skip_count = 0
+
         raw_items = []
         for p in Path(".").glob("*.pdf"):
             raw_items.append({"source": str(p), "metadata": {}})
@@ -419,19 +519,55 @@ class LiteratureStage:
 
         raw_records = [normalize_work(item) for item in raw_items if item.get("source")]
         deduped_records, literature_stats, clusters_summary = _dedup_work_records(raw_records)
+
+        if len(deduped_records) > limits["max_works"]:
+            _handle_budget_breach(st, "budget_works_reached", fail_fast)
+            deduped_records = deduped_records[: limits["max_works"]]
+            literature_stats["works_dedup_count"] = len(deduped_records)
+            literature_stats["dedup_removed"] = literature_stats["works_raw_count"] - literature_stats["works_dedup_count"]
+
+        clusters_summary = {
+            "cluster_count": len({str(r.get("cluster_key", "")) for r in deduped_records if str(r.get("cluster_key", ""))}),
+            "largest_cluster_size": 1 if deduped_records else 0,
+        }
+
         st.work_records = deduped_records
         st.literature_stats = literature_stats
         st.clusters_summary = clusters_summary
 
         sources = []
+        seen_sources = set()
         for rec in deduped_records:
-            urls = rec.get("urls", [])
-            if isinstance(urls, list) and urls:
-                sources.append(urls[0])
+            selected = _select_source_from_record(rec)
+            if not selected:
+                continue
+            key = selected.lower()
+            if key in seen_sources:
+                continue
+            seen_sources.add(key)
+            sources.append(selected)
 
+        sources = sorted(sources, key=lambda s: s.lower())
+        if len(sources) > limits["max_sources"]:
+            _handle_budget_breach(st, "budget_sources_reached", fail_fast)
+            sources = sources[: limits["max_sources"]]
+        if isinstance(st.literature_stats, dict):
+            st.literature_stats["sources_selected_count"] = len(sources)
+            st.literature_stats["sources_limit"] = limits["max_sources"]
+
+        os.environ["LITERATURE_MAX_PDFS"] = str(limits["max_pdfs"])
+        os.environ["LITERATURE_MAX_PDF_BYTES"] = str(limits["max_pdf_bytes"])
         agent = LiteratureReviewAgent(sources)
         results = agent.run(st.topic or "Research")
-        
+        ingest_budget = get_last_budget_usage()
+        if isinstance(ingest_budget, dict):
+            st.budget_skip_count = int(ingest_budget.get("budget_skip_count", 0))
+            if st.budget_skip_count > 0:
+                st.budget_enforced = True
+            ingest_reason = str(ingest_budget.get("budget_stop_reason", "none"))
+            if ingest_reason != "none" and not st.budget_stop_reason:
+                st.budget_stop_reason = ingest_reason
+
         st.annotated_bib = results["annotated_bib"]
         st.evidence_table = results["evidence_table"]
         st.missing_matrix = results["missing_matrix"]
@@ -841,9 +977,26 @@ class PaperStage:
                 meta["clusters_summary"] = st.clusters_summary
             manifest["meta"] = meta
 
-            budgets = _scan_provider_budgets(out_dir)
-            st.budgets = budgets
-            manifest["budgets"] = budgets
+            provider_usage = _scan_provider_budgets(out_dir)
+            budget_payload = {
+                "budgets_enforced": bool(st.budget_enforced),
+                "budget_stop_reason": st.budget_stop_reason or "none",
+                "budget_limits": st.budget_limits or _read_literature_budget_limits(),
+                "usage": {
+                    "works_raw_count": (st.literature_stats or {}).get("works_raw_count", 0) if isinstance(st.literature_stats, dict) else 0,
+                    "works_dedup_count": (st.literature_stats or {}).get("works_dedup_count", 0) if isinstance(st.literature_stats, dict) else 0,
+                    "sources_selected_count": (st.literature_stats or {}).get("sources_selected_count", 0) if isinstance(st.literature_stats, dict) else 0,
+                    "budget_skip_count": int(st.budget_skip_count or 0),
+                    "calls_total": provider_usage.get("calls_total", 0),
+                    "pdf_count": provider_usage.get("pdf_count", 0),
+                    "pdf_bytes": provider_usage.get("pdf_bytes", 0),
+                    "fail_count": provider_usage.get("fail_count", 0),
+                    "retries_total": provider_usage.get("retries_total", 0),
+                },
+                "stop_reason_top": provider_usage.get("stop_reason_top", []),
+            }
+            st.budgets = budget_payload
+            manifest["budgets"] = budget_payload
 
             (out_dir / "paper.md").write_text(st.paper_md, encoding="utf-8")
             (out_dir / "paper_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
