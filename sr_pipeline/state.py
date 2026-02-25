@@ -36,6 +36,9 @@ class ResearchState:
     # Level-5 Critic & Iteration
     critic_report: Optional[Dict[str, Any]] = None
     iteration_state: Dict[str, Any] = field(default_factory=lambda: {"attempt": 0, "max_iters": 2})
+    iter_state: Dict[str, Any] = field(
+        default_factory=lambda: {"iter_id": None, "history": [], "best_score": 0.0, "best_iter_dir": None}
+    )
 
     # Control knobs for dummy iteration
     iteration: int = 0

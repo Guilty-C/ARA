@@ -2350,6 +2350,100 @@ def run_budget_controlled_case_test():
     }
 
 
+def run_iteration_smoke_test():
+    print("--- Running Iteration Smoke Test ---")
+    out_root = Path("outputs_test/iterate_smoke")
+    if out_root.exists():
+        shutil.rmtree(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    cfg_path = Path("outputs_test/iterate_smoke_config.json")
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        json.dumps(
+            {"topic": "industrial anomaly detection", "constraints": {"compute": "low"}},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    server_env = os.environ.copy()
+    server_env["PORT"] = "8103"
+    server_process = subprocess.Popen(
+        [sys.executable, "tools_server/dummy_tool_server.py"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=server_env,
+    )
+    if not wait_for_port("127.0.0.1", 8103):
+        return {"pass": False, "error": "server_start_failed"}
+
+    try:
+        env = os.environ.copy()
+        env["TOOL_API_BASE"] = "http://127.0.0.1:8103"
+        env["API_BASE_URL"] = "http://127.0.0.1:8103/api"
+        env["PROVIDER_MODE"] = "REPLAY"
+        env["MOCK_TIMESTAMP"] = "1234567890"
+
+        run = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ara",
+                "iterate",
+                "--mode",
+                "REPLAY",
+                "--output-root",
+                str(out_root),
+                "--config",
+                str(cfg_path),
+                "--max-iters",
+                "2",
+                "--target-score",
+                "999",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        iterate_line = ""
+        for line in run.stdout.splitlines():
+            if line.startswith("ITERATE_RESULT="):
+                iterate_line = line
+        result = {}
+        if iterate_line:
+            try:
+                result = json.loads(iterate_line.split("=", 1)[1])
+            except Exception:
+                result = {}
+
+        run_dir = Path(result.get("run_dir", "")) if isinstance(result, dict) else Path("")
+        iter_0001 = run_dir / "iters" / "0001" / "iteration_manifest.json"
+        iter_dirs = []
+        if (run_dir / "iters").exists():
+            iter_dirs = [p for p in (run_dir / "iters").iterdir() if p.is_dir()]
+        stop_reason = str(result.get("stop_reason", "")) if isinstance(result, dict) else ""
+        allowed = {"reached_target_score", "budget_exhausted", "no_progress_k_rounds", "tool_failure"}
+
+        ok = (
+            run.returncode == 0
+            and iter_0001.exists()
+            and len(iter_dirs) >= 2
+            and stop_reason in allowed
+        )
+        return {
+            "pass": ok,
+            "returncode": run.returncode,
+            "stdout": run.stdout,
+            "stop_reason": stop_reason,
+            "iter_count": len(iter_dirs),
+        }
+    finally:
+        server_process.terminate()
+        server_process.wait()
+
+
 def main():
     minireal = run_minireal_quality_gate_test()
     leakage = run_leakage_controlled_fail_test()
@@ -2358,6 +2452,7 @@ def main():
     cli = run_cli_smoke_test()
     dedup_case = run_dedup_controlled_case_test()
     budget_case = run_budget_controlled_case_test()
+    iterate_case = run_iteration_smoke_test()
 
     score = 10
     if not minireal.get("pass"):
@@ -2375,6 +2470,8 @@ def main():
     if not dedup_case.get("pass"):
         score -= 2
     if not budget_case.get("pass"):
+        score -= 2
+    if not iterate_case.get("pass"):
         score -= 2
     if score < 0:
         score = 0
@@ -2405,6 +2502,9 @@ def main():
             "dedup_controlled_case": bool(dedup_case.get("pass")),
             "budget_controlled_case": bool(budget_case.get("pass")),
         },
+        "milestone8": {
+            "iteration_smoke": bool(iterate_case.get("pass")),
+        },
     }
 
     print(f"ACCEPTANCE_JSON={json.dumps(acceptance, sort_keys=True)}")
@@ -2417,6 +2517,7 @@ def main():
         and cli.get("pass")
         and dedup_case.get("pass")
         and budget_case.get("pass")
+        and iterate_case.get("pass")
         and (minireal.get("stats", {}).get("avg_precision", 0.0) >= 0.05)
     )
     sys.exit(0 if all_ok else 1)

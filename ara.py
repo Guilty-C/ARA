@@ -4,6 +4,7 @@ import getpass
 import json
 import os
 import secrets
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -47,45 +48,140 @@ def _resolve_run_output_dir(args: argparse.Namespace) -> tuple[Path, str | None]
     return Path(args.output_dir), None
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    env = os.environ.copy()
-    run_dir, generated_run_id = _resolve_run_output_dir(args)
-    env["OUTPUT_DIR"] = str(run_dir)
-
+def _read_initial_state_payload(args: argparse.Namespace) -> tuple[str | None, int]:
     if args.initial_state_json and args.config:
         print("error: use either --config or --initial-state-json", file=sys.stderr)
-        return 2
-
+        return None, 2
     if args.initial_state_json:
         try:
             json.loads(args.initial_state_json)
         except json.JSONDecodeError:
             print("error: --initial-state-json must be valid JSON", file=sys.stderr)
-            return 2
-        env["INITIAL_STATE"] = args.initial_state_json
-    elif args.config:
+            return None, 2
+        return args.initial_state_json, 0
+    if args.config:
         cfg = Path(args.config)
         if not cfg.exists():
             print(f"error: config missing: {cfg}", file=sys.stderr)
-            return 2
+            return None, 2
         try:
             cfg_text = cfg.read_text(encoding="utf-8")
             json.loads(cfg_text)
+            return cfg_text, 0
         except Exception:
             print("error: --config must contain valid JSON", file=sys.stderr)
-            return 2
-        env["INITIAL_STATE"] = cfg_text
+            return None, 2
+    return None, 0
 
+
+def _run_pipeline_once(
+    output_dir: Path,
+    *,
+    initial_state: str | None,
+    mode: str | None = None,
+    extra_env: dict | None = None,
+) -> tuple[int, str]:
+    env = os.environ.copy()
+    env["OUTPUT_DIR"] = str(output_dir)
+    if initial_state is not None:
+        env["INITIAL_STATE"] = initial_state
+    if mode:
+        env["PROVIDER_MODE"] = mode
+    if extra_env:
+        for k, v in extra_env.items():
+            env[k] = str(v)
     proc = subprocess.run(
         [sys.executable, "run_pipeline.py"],
         env=env,
         capture_output=True,
         text=True,
     )
-    if proc.returncode != 0:
-        if proc.stderr:
-            print(proc.stderr.strip(), file=sys.stderr)
-        return proc.returncode
+    return proc.returncode, (proc.stderr or "").strip()
+
+
+def _clamp(x: float, low: float, high: float) -> float:
+    return max(low, min(high, x))
+
+
+def _evaluate_iter_dir(iter_dir: Path) -> tuple[dict, dict]:
+    state = _load_json(iter_dir / "state.json") or {}
+    manifest = _load_json(iter_dir / "paper_manifest.json") or {}
+    budgets = manifest.get("budgets", {}) if isinstance(manifest, dict) else {}
+    meta = manifest.get("meta", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    critic_pass = False
+    if isinstance(state, dict):
+        critic = state.get("critic_report")
+        if isinstance(critic, dict):
+            critic_pass = bool(critic.get("critic_pass", False))
+
+    accuracy_mean = 0.0
+    if isinstance(state, dict):
+        exp = state.get("experiment_results")
+        if isinstance(exp, dict):
+            agg = exp.get("aggregate")
+            if isinstance(agg, dict):
+                raw = agg.get("accuracy_mean")
+                if isinstance(raw, (int, float)):
+                    accuracy_mean = float(raw)
+
+    literature_stats = meta.get("literature_stats", {})
+    if not isinstance(literature_stats, dict):
+        literature_stats = {}
+    works_dedup_count = int(literature_stats.get("works_dedup_count", 0))
+
+    usage = budgets.get("usage", {}) if isinstance(budgets, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    fail_count = int(usage.get("fail_count", 0))
+
+    score = (
+        50
+        + (20 if critic_pass else 0)
+        + int(min(20, works_dedup_count))
+        + int(10 * _clamp(accuracy_mean, 0.0, 1.0))
+        - int(5 * fail_count)
+    )
+    score = int(_clamp(float(score), 0.0, 100.0))
+    evaluation = {
+        "overall_score": score,
+        "rubric": {
+            "critic_pass": critic_pass,
+            "works_dedup_count": works_dedup_count,
+            "experiment_accuracy_mean": accuracy_mean,
+            "fail_count": fail_count,
+        },
+    }
+    return evaluation, budgets if isinstance(budgets, dict) else {}
+
+
+def _sync_iter_to_run_dir(run_dir: Path, iter_dir: Path) -> None:
+    for name in ["paper.md", "paper_manifest.json", "evidence_table.json", "critic_report.json", "state.json"]:
+        src = iter_dir / name
+        dst = run_dir / name
+        if src.exists():
+            shutil.copy2(src, dst)
+    for dname in ["providers", "logs"]:
+        src_d = iter_dir / dname
+        dst_d = run_dir / dname
+        if src_d.exists() and src_d.is_dir():
+            if dst_d.exists():
+                shutil.rmtree(dst_d)
+            shutil.copytree(src_d, dst_d)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    run_dir, generated_run_id = _resolve_run_output_dir(args)
+    initial_state, rc = _read_initial_state_payload(args)
+    if rc != 0:
+        return rc
+    run_rc, run_stderr = _run_pipeline_once(run_dir, initial_state=initial_state)
+    if run_rc != 0:
+        if run_stderr:
+            print(run_stderr, file=sys.stderr)
+        return run_rc
 
     if generated_run_id:
         print(f"RUN_ID={generated_run_id}")
@@ -95,6 +191,172 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_id = _resolve_run_id(run_dir)
     print(f"RUN_ID={run_id}")
     return 0
+
+
+def cmd_iterate(args: argparse.Namespace) -> int:
+    mode = (args.mode or "REPLAY").upper()
+    if mode not in {"REPLAY", "LIVE"}:
+        print("error: --mode must be REPLAY or LIVE", file=sys.stderr)
+        return 2
+
+    initial_state, rc = _read_initial_state_payload(args)
+    if rc != 0:
+        return rc
+    if initial_state is None:
+        print("error: iterate requires --config or --initial-state-json", file=sys.stderr)
+        return 2
+    if args.max_iters < 1:
+        print("error: --max-iters must be >= 1", file=sys.stderr)
+        return 2
+    if args.no_progress_k < 1:
+        print("error: --no-progress-k must be >= 1", file=sys.stderr)
+        return 2
+
+    if args.resume:
+        resume_dir = Path(args.resume)
+        resume_manifest = _load_json(resume_dir / "iteration_manifest.json")
+        if not (resume_dir.exists() and resume_dir.is_dir() and isinstance(resume_manifest, dict)):
+            print(f"error: --resume must point to an iter_dir with iteration_manifest.json: {resume_dir}", file=sys.stderr)
+            return 2
+        run_dir = resume_dir.parent.parent
+        run_id = run_dir.name
+        iters_dir = run_dir / "iters"
+        existing_iters = sorted([p for p in iters_dir.iterdir() if p.is_dir()], key=lambda p: p.name) if iters_dir.exists() else []
+        next_idx = len(existing_iters) + 1
+        best_score = float(resume_manifest.get("decision", {}).get("best_score", 0))
+        history = []
+        for it in existing_iters:
+            m = _load_json(it / "iteration_manifest.json")
+            if isinstance(m, dict):
+                ev = m.get("evaluation", {})
+                if isinstance(ev, dict):
+                    s = ev.get("overall_score")
+                    if isinstance(s, (int, float)):
+                        history.append(float(s))
+    else:
+        if not args.output_root:
+            print("error: iterate requires --output-root when --resume is not used", file=sys.stderr)
+            return 2
+        output_root = Path(args.output_root)
+        run_id = _make_run_id()
+        run_dir = output_root / "runs" / run_id
+        iters_dir = run_dir / "iters"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        next_idx = 1
+        best_score = -1.0
+        history = []
+
+    best_iter_dir = None
+    rounds_without_progress = 0
+    final_stop_reason = "no_progress_k_rounds"
+    iters_run = 0
+    parent_iter_id = None
+
+    for step in range(args.max_iters):
+        iter_num = next_idx + step
+        iter_id = f"{iter_num:04d}"
+        iter_dir = iters_dir / iter_id
+        iter_dir.mkdir(parents=True, exist_ok=True)
+
+        run_rc, run_stderr = _run_pipeline_once(
+            iter_dir,
+            initial_state=initial_state,
+            mode=mode,
+        )
+        if run_rc != 0 and run_stderr:
+            print(run_stderr, file=sys.stderr)
+
+        _sync_iter_to_run_dir(run_dir, iter_dir)
+
+        evaluation, budgets = _evaluate_iter_dir(iter_dir)
+        overall_score = float(evaluation.get("overall_score", 0))
+        history.append(overall_score)
+
+        if overall_score > best_score:
+            best_score = overall_score
+            best_iter_dir = str(iter_dir)
+            rounds_without_progress = 0
+        else:
+            rounds_without_progress += 1
+
+        budget_stop = "none"
+        budget_limits = {}
+        budget_usage = {}
+        if isinstance(budgets, dict):
+            budget_stop = str(budgets.get("budget_stop_reason", "none") or "none")
+            budget_limits = budgets.get("budget_limits", {}) if isinstance(budgets.get("budget_limits"), dict) else {}
+            budget_usage = budgets.get("usage", {}) if isinstance(budgets.get("usage"), dict) else {}
+
+        stop_reason = "none"
+        if run_rc != 0:
+            stop_reason = "tool_failure"
+        elif overall_score >= float(args.target_score):
+            stop_reason = "reached_target_score"
+        elif budget_stop != "none":
+            stop_reason = "budget_exhausted"
+        elif rounds_without_progress >= int(args.no_progress_k):
+            stop_reason = "no_progress_k_rounds"
+        elif step == args.max_iters - 1:
+            stop_reason = "no_progress_k_rounds"
+
+        review_payload = {
+            "iter_id": iter_id,
+            "overall_score": overall_score,
+            "rubric": evaluation.get("rubric", {}),
+        }
+        (iter_dir / "review_score.json").write_text(json.dumps(review_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        iter_manifest = {
+            "iter_id": iter_id,
+            "parent_iter_id": parent_iter_id,
+            "mode": mode,
+            "plan": {
+                "actions": ["run_pipeline", "evaluate", "decide"],
+                "expected_gain": {"score_delta": 1 if stop_reason == "none" else 0},
+            },
+            "executed_actions": ["run_pipeline", "evaluate", "decide"],
+            "evaluation": evaluation,
+            "decision": {
+                "stop_reason": stop_reason,
+                "next_actions": [] if stop_reason != "none" else ["expand_search"],
+                "best_score": best_score,
+            },
+            "budgets": {
+                "usage": budget_usage,
+                "limits": budget_limits,
+                "budget_stop_reason": budget_stop,
+            },
+            "artifacts": {
+                "iter_dir": str(iter_dir),
+                "paper_manifest": str(iter_dir / "paper_manifest.json"),
+                "state": str(iter_dir / "state.json"),
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        (iter_dir / "iteration_manifest.json").write_text(
+            json.dumps(iter_manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        parent_iter_id = iter_id
+        iters_run += 1
+
+        if stop_reason != "none":
+            final_stop_reason = stop_reason
+            break
+
+    result = {
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "iters_run": iters_run,
+        "best_score": best_score,
+        "best_iter_dir": best_iter_dir,
+        "stop_reason": final_stop_reason,
+    }
+    print(f"RUN_ID={run_id}")
+    print(f"RUN_DIR={run_dir}")
+    print(f"ITERATE_RESULT={json.dumps(result, ensure_ascii=False)}")
+    return 1 if final_stop_reason == "tool_failure" else 0
 
 
 def _load_json(path: Path):
@@ -700,6 +962,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--config")
     p_run.add_argument("--initial-state-json")
     p_run.set_defaults(func=cmd_run)
+
+    p_iter = sub.add_parser("iterate")
+    p_iter.add_argument("--output-root")
+    p_iter.add_argument("--output-dir", default="outputs")
+    p_iter.add_argument("--config")
+    p_iter.add_argument("--initial-state-json")
+    p_iter.add_argument("--max-iters", type=int, default=2)
+    p_iter.add_argument("--target-score", type=float, default=80.0)
+    p_iter.add_argument("--mode", choices=["REPLAY", "LIVE"], default="REPLAY")
+    p_iter.add_argument("--no-progress-k", type=int, default=2)
+    p_iter.add_argument("--policy", default="simple")
+    p_iter.add_argument("--resume")
+    p_iter.set_defaults(func=cmd_iterate)
 
     p_report = sub.add_parser("report")
     p_report.add_argument("output_dir")
