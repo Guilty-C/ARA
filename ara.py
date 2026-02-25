@@ -3,6 +3,7 @@ import hashlib
 import getpass
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -707,8 +708,57 @@ def cmd_doctor(_: argparse.Namespace) -> int:
         print("UNPAYWALL_EMAIL=SET (env)")
     else:
         print("UNPAYWALL_EMAIL=UNSET")
+    live_status = "READY"
+    live_stop_reason = "none"
+    if provider_mode.upper() == "LIVE":
+        missing = []
+        if not (env_key or file_key):
+            missing.append("missing_openalex_api_key")
+        if not unpaywall_email:
+            missing.append("missing_unpaywall_email")
+        if missing:
+            live_status = "SKIP"
+            live_stop_reason = ",".join(missing)
+    print(
+        "DOCTOR_RESULT="
+        + json.dumps(
+            {
+                "provider_mode": provider_mode.upper(),
+                "live_status": live_status,
+                "live_stop_reason": live_stop_reason,
+            },
+            ensure_ascii=False,
+        )
+    )
     print("TIP: set PROVIDER_MODE=LIVE to enable real API calls")
     return 0 if ok else 1
+
+
+def _classify_live_failure(status: str, stop_reason: str) -> str:
+    text = f"{status} {stop_reason}".lower()
+    if ("dns" in text) or ("name resolution" in text) or ("getaddrinfo" in text):
+        return "dns_fail"
+    if ("429" in text) or ("rate" in text):
+        return "rate_limited"
+    m = re.search(r"http[_\s:-]*(\d{3})", text)
+    if m:
+        code = int(m.group(1))
+        if 400 <= code <= 499:
+            return "http_4xx"
+        if 500 <= code <= 599:
+            return "http_5xx"
+    if ("json" in text) or ("parse" in text) or ("decode" in text):
+        return "parse_fail"
+    if (
+        ("connect" in text)
+        or ("connection" in text)
+        or ("timeout" in text)
+        or ("proxy" in text)
+        or ("ssl" in text)
+        or ("refused" in text)
+    ):
+        return "connect_fail"
+    return "connect_fail"
 
 def cmd_live_smoke(args: argparse.Namespace) -> int:
     mode = (args.mode or os.environ.get("PROVIDER_MODE", "REPLAY")).upper()
@@ -909,7 +959,8 @@ def cmd_net_smoke(args: argparse.Namespace) -> int:
             result["openalex"] = {
                 "verdict": "FAIL",
                 "status": status,
-                "stop_reason": stop_reason,
+                "stop_reason": _classify_live_failure(status, stop_reason) if mode == "LIVE" else stop_reason,
+                "raw_stop_reason": stop_reason,
                 "sha256": None,
             }
     else:
@@ -943,7 +994,8 @@ def cmd_net_smoke(args: argparse.Namespace) -> int:
             result["unpaywall"] = {
                 "verdict": "FAIL",
                 "status": status,
-                "stop_reason": stop_reason,
+                "stop_reason": _classify_live_failure(status, stop_reason) if mode == "LIVE" else stop_reason,
+                "raw_stop_reason": stop_reason,
                 "sha256": None,
             }
     else:

@@ -1,10 +1,12 @@
 import os
+import re
 import subprocess
 import sys
 import time
 import socket
 import shutil
 import json
+import zipfile
 from pathlib import Path
 
 def wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -2639,6 +2641,59 @@ def run_evidence_gate_test():
     }
 
 
+def run_secrets_leak_scan_test():
+    print("--- Running Secrets Leak Scan Test ---")
+    outputs_root = Path("outputs_test")
+    patterns = [
+        re.compile(r"openalex_api_key", re.IGNORECASE),
+        re.compile(r"unpaywall_email", re.IGNORECASE),
+        re.compile(r"api[_-]?key\\s*[:=]"),
+        re.compile(r"authorization\\s*[:=]", re.IGNORECASE),
+        re.compile(r"bearer\\s+[a-z0-9._\\-]+", re.IGNORECASE),
+        re.compile(r"mailto\\s*=", re.IGNORECASE),
+    ]
+    hits = []
+    scanned_files = 0
+
+    def _scan_text(text: str, path_label: str):
+        nonlocal hits
+        for pat in patterns:
+            if pat.search(text):
+                hits.append({"path": path_label, "pattern": pat.pattern})
+                break
+
+    if outputs_root.exists():
+        for p in outputs_root.rglob("*"):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(outputs_root).as_posix()
+            lower_rel = rel.lower()
+            if ("/logs/" in f"/{lower_rel}") or ("/providers/" in f"/{lower_rel}"):
+                scanned_files += 1
+                try:
+                    txt = p.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    txt = ""
+                _scan_text(txt, f"outputs_test/{rel}")
+
+        for z in outputs_root.rglob("*_bundle.zip"):
+            scanned_files += 1
+            try:
+                with zipfile.ZipFile(z, "r") as zf:
+                    if "INDEX.txt" in zf.namelist():
+                        idx_text = zf.read("INDEX.txt").decode("utf-8", errors="ignore")
+                        _scan_text(idx_text, f"{z.as_posix()}::INDEX.txt")
+            except Exception:
+                hits.append({"path": z.as_posix(), "pattern": "zip_read_failed"})
+
+    return {
+        "pass": len(hits) == 0,
+        "hits": hits[:10],
+        "hit_count": len(hits),
+        "scanned_files": scanned_files,
+    }
+
+
 def main():
     minireal = run_minireal_quality_gate_test()
     leakage = run_leakage_controlled_fail_test()
@@ -2650,6 +2705,7 @@ def main():
     iterate_case = run_iteration_smoke_test()
     scorer_det = run_scorer_determinism_test()
     evidence_gate = run_evidence_gate_test()
+    secrets_scan = run_secrets_leak_scan_test()
 
     score = 10
     if not minireal.get("pass"):
@@ -2673,6 +2729,8 @@ def main():
     if not scorer_det.get("pass"):
         score -= 2
     if not evidence_gate.get("pass"):
+        score -= 2
+    if not secrets_scan.get("pass"):
         score -= 2
     if score < 0:
         score = 0
@@ -2712,6 +2770,9 @@ def main():
         "milestone10": {
             "evidence_gate": bool(evidence_gate.get("pass")),
         },
+        "milestone11": {
+            "secrets_leak_scan": bool(secrets_scan.get("pass")),
+        },
     }
 
     print(f"ACCEPTANCE_JSON={json.dumps(acceptance, sort_keys=True)}")
@@ -2727,6 +2788,7 @@ def main():
         and iterate_case.get("pass")
         and scorer_det.get("pass")
         and evidence_gate.get("pass")
+        and secrets_scan.get("pass")
         and (minireal.get("stats", {}).get("avg_precision", 0.0) >= 0.05)
     )
     sys.exit(0 if all_ok else 1)
